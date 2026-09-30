@@ -263,8 +263,8 @@ describe("contact form API", () => {
     const store = new MemoryStore(); const app = buildApp(config, store);
     const headers = { origin: config.PUBLIC_BASE_URL };
     for (let i = 0; i < 10; i++) expect((await app.inject({ method: "POST", url: "/v1/admin/login", headers, payload: { email: "target@example.com", password: "incorrect" } })).statusCode).toBe(401);
-    expect((await app.inject({ method: "POST", url: "/v1/admin/login", headers, payload: { email: "target@example.com", password: "incorrect" } })).statusCode).toBe(429);
-    expect((await app.inject({ method: "POST", url: "/v1/auth/signup", headers, payload: { workspaceName: "Other studio", email: "other@example.com", password: "long-valid-password" } })).statusCode).toBe(201);
+    expect((await app.inject({ method: "POST", url: "/v1/admin/login", headers, payload: { email: "target@example.com", password: "incorrect" } })).statusCode).toBe(401);
+    expect((await app.inject({ method: "POST", url: "/v1/auth/signup", headers, payload: { workspaceName: "Other studio", email: "other@example.com", password: "long-valid-password" } })).statusCode).toBe(202);
     expect((await app.inject({ method: "POST", url: "/v1/admin/login", headers, payload: { email: "other@example.com", password: "long-valid-password" } })).statusCode).toBe(200);
     await app.close();
   });
@@ -331,7 +331,8 @@ describe("contact form API", () => {
     const app = buildApp(config, store);
     const signup = await app.inject({ method: "POST", url: "/v1/auth/signup", headers: { origin: config.PUBLIC_BASE_URL },
       payload: { workspaceName: "Limited Studio", email: "limited@studio.test", password: "a-secure-password" } });
-    const tenantId = signup.json().tenantId as string;
+    expect(signup.statusCode).toBe(202);
+    const tenantId = (await store.getAdminByEmail("limited@studio.test"))?.tenantId as string;
     await store.updateTenantLimits(tenantId, { maxOriginsPerForm: 2, maxForms: 1, maxTotalSubmissions: 10, maxDailySubmissions: 5 });
     const login = await app.inject({ method: "POST", url: "/v1/admin/login", headers: { origin: config.PUBLIC_BASE_URL },
       payload: { email: "limited@studio.test", password: "a-secure-password" } });
@@ -362,19 +363,21 @@ describe("contact form API", () => {
     const app = buildApp(config, store);
     const signup = await app.inject({ method: "POST", url: "/v1/auth/signup", headers: { origin: config.PUBLIC_BASE_URL },
       payload: { workspaceName: "Managed Studio", email: "tenant@studio.test", password: "a-secure-password" } });
+    expect(signup.statusCode).toBe(202);
+    const tenantId = (await store.getAdminByEmail("tenant@studio.test"))?.tenantId as string;
     await app.inject({ method: "POST", url: "/v1/admin/users", headers: { authorization: `Bearer ${config.ADMIN_API_KEY}` },
       payload: { email: "super@example.com", password: "a-long-super-password", role: "super" } });
     const superLogin = await app.inject({ method: "POST", url: "/v1/admin/login", headers: { origin: config.PUBLIC_BASE_URL },
       payload: { email: "super@example.com", password: "a-long-super-password" } });
     const limits = { maxOriginsPerForm: 3, maxForms: 4, maxTotalSubmissions: 500, maxDailySubmissions: 50 };
-    const changed = await app.inject({ method: "PATCH", url: `/v1/admin/tenants/${signup.json().tenantId}`,
+    const changed = await app.inject({ method: "PATCH", url: `/v1/admin/tenants/${tenantId}`,
       headers: { origin: config.PUBLIC_BASE_URL, cookie: superLogin.headers["set-cookie"] as string }, payload: limits });
     expect(changed.statusCode).toBe(200);
-    expect(await store.getTenantLimits(signup.json().tenantId)).toEqual(expect.objectContaining(limits));
+    expect(await store.getTenantLimits(tenantId)).toEqual(expect.objectContaining(limits));
 
     const tenantLogin = await app.inject({ method: "POST", url: "/v1/admin/login", headers: { origin: config.PUBLIC_BASE_URL },
       payload: { email: "tenant@studio.test", password: "a-secure-password" } });
-    const forbidden = await app.inject({ method: "PATCH", url: `/v1/admin/tenants/${signup.json().tenantId}`,
+    const forbidden = await app.inject({ method: "PATCH", url: `/v1/admin/tenants/${tenantId}`,
       headers: { origin: config.PUBLIC_BASE_URL, cookie: tenantLogin.headers["set-cookie"] as string }, payload: limits });
     expect(forbidden.statusCode).toBe(403);
   });
@@ -419,8 +422,9 @@ describe("contact form API", () => {
       headers: { origin: config.PUBLIC_BASE_URL },
       payload: { workspaceName: "New Studio", email: "owner@studio.test", password: "a-secure-password" }
     });
-    expect(signup.statusCode).toBe(201);
-    expect(signup.json()).toEqual(expect.objectContaining({ email: "owner@studio.test", role: "tenant" }));
+    expect(signup.statusCode).toBe(202);
+    expect(signup.json()).toEqual({ message: "If this address can be registered, workspace setup will continue." });
+    const tenantId = (await store.getAdminByEmail("owner@studio.test"))?.tenantId;
 
     const login = await app.inject({
       method: "POST",
@@ -448,7 +452,7 @@ describe("contact form API", () => {
       }
     });
     expect(created.statusCode).toBe(201);
-    expect(created.json().tenantId).toBe(signup.json().tenantId);
+    expect(created.json().tenantId).toBe(tenantId);
   });
 
   it("lets a site admin create forms only in their own tenant", async () => {

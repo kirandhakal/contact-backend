@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { readFile, readdir } from "node:fs/promises";
 import { beforeAll, afterAll, describe, expect, it } from "vitest";
-import pg from "../node_modules/@types/pg/index.js";
+import pg from "pg";
 import { PostgresStore } from "../src/db/postgres-store.js";
 import { hashPassword, hashSessionToken } from "../src/admin-auth.js";
 import type { ListQuery } from "../src/management.js";
