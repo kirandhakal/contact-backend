@@ -1,3 +1,4 @@
+import { checkLogin } from "./login-lockout.js";
 import { createRequire } from "node:module";
 import { z } from "zod";
 import { listQuery } from "./management.js";
@@ -137,8 +138,6 @@ export function buildApp(config: AppConfig, store: Store) {
     bodyLimit: config.MAX_BODY_BYTES
   });
   const limiter = new FixedWindowRateLimiter(config.RATE_LIMIT_WINDOW_SECONDS * 1000, config.RATE_LIMIT_MAX);
-  const loginLimiter = new FixedWindowRateLimiter(15 * 60 * 1000, 10);
-  const loginIpLimiter = new FixedWindowRateLimiter(15 * 60 * 1000, 20);
   const signupLimiter = new FixedWindowRateLimiter(60 * 60 * 1000, 5);
   const authTrafficLimiter = new FixedWindowRateLimiter(15 * 60 * 1000, 300);
   const passwordLimiter = new FixedWindowRateLimiter(15 * 60 * 1000, 10);
@@ -194,7 +193,12 @@ export function buildApp(config: AppConfig, store: Store) {
 
   app.get("/health/live", async () => ({ status: "ok" }));
 
-  app.get("/", async () => ({ service: "Contact API", health: "/health/ready" }));
+  app.get("/", async () => ({
+    service: "Contact API", version: "v1",
+    message: "Welcome to Contact API. Use the Contact web app to sign in and manage your workspace, or submit forms through the API.",
+    health: "/health/ready",
+    endpoints: { liveness: "/health/live", readiness: "/health/ready", login: "POST /v1/admin/login", signup: "POST /v1/auth/signup", submit: "POST /v1/forms/{publicKey}/submissions" }
+  }));
 
   app.get("/health/ready", async (_request, reply) => {
     if (await store.ready()) return { status: "ok" };
@@ -210,21 +214,22 @@ export function buildApp(config: AppConfig, store: Store) {
       ![undefined, "admin", "tenant"].includes(request.body.portal as string | undefined)) return problem(reply, 400, "Invalid request", "Email and password are required.");
     const email = request.body.email.trim().toLowerCase();
     if (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !request.body.password || request.body.password.length > 256) return problem(reply, 400, "Invalid request", "Invalid credentials.");
-    const accountAllowed = loginLimiter.check(email).allowed;
-    const ipAllowed = loginIpLimiter.check(request.ip).allowed;
     const admin = await store.getAdminByEmail(email);
-    const passwordMatches = await verifyPassword(request.body.password, admin?.passwordHash ?? await dummyPasswordHash);
-    if (!accountAllowed || !ipAllowed || !admin || !passwordMatches) {
-      return problem(reply, 401, "Unauthorized", "Invalid email or password.");
+    const portal = request.body.portal;
+    const password = request.body.password;
+    const result = await store.withLoginState(hashSessionToken(email), (state) => checkLogin(state, async () => {
+      const matches = await verifyPassword(password, admin?.passwordHash ?? await dummyPasswordHash);
+      const isStaff = admin?.role === "sudo" || admin?.role === "super";
+      return !!admin && matches && !(portal === "admin" && !isStaff) && !(portal === "tenant" && isStaff);
+    }));
+    if (result.retryAfterSeconds > 0) {
+      reply.header("Retry-After", result.retryAfterSeconds);
+      return problem(reply, 429, "Sign-in temporarily locked", "Too many failed sign-in attempts. Please wait before trying again.", {
+        code: "LOGIN_LOCKED", retryAfterSeconds: result.retryAfterSeconds,
+        lockedUntil: new Date(Date.now() + result.retryAfterSeconds * 1000).toISOString()
+      });
     }
-    const portal = request.body.portal === "admin" || request.body.portal === "tenant" ? request.body.portal : null;
-    const isStaff = admin.role === "sudo" || admin.role === "super";
-    if (portal === "admin" && !isStaff) {
-      return problem(reply, 401, "Unauthorized", "Invalid email or password.");
-    }
-    if (portal === "tenant" && isStaff) {
-      return problem(reply, 401, "Unauthorized", "Invalid email or password.");
-    }
+    if (!result.allowed || !admin) return problem(reply, 401, "Unauthorized", "Invalid email or password.");
     const token = newSessionToken();
     await store.createAdminSession(admin.id, hashSessionToken(token), new Date(Date.now() + 8 * 60 * 60 * 1000));
     const secure = new URL(config.PUBLIC_BASE_URL).protocol === "https:" ? "; Secure" : "";

@@ -35,6 +35,13 @@ const config = {
 };
 
 class MemoryStore implements Store {
+  loginStates = new Map<string, import("../src/login-lockout.js").LoginState>();
+  async withLoginState<T>(key: string, action: (state: import("../src/login-lockout.js").LoginState) => Promise<T>): Promise<T> {
+    const state = this.loginStates.get(key) ?? { failures: 0, level: 0, lockedUntil: 0 };
+    this.loginStates.set(key, state);
+    return action(state);
+  }
+
   async managementPage(resource: "forms" | "tenants" | "submissions", query: ListQuery, publicKey?: string): Promise<PageResult> {
     let rows: Record<string, unknown>[] = resource === "forms" ? await this.listFormSummaries() as unknown as Record<string, unknown>[] : resource === "tenants" ? (await this.listTenants()).map(t => ({ ...t, activeFormCount: [...this.forms.values()].filter(f => f.tenantId === t.id && f.status === "active").length })) : this.submissions.filter(s => s.formId === this.forms.get(publicKey!)?.id && s.status !== "deleted") as unknown as Record<string, unknown>[];
     rows = rows.filter(r => (!query.tenantId || (resource === "tenants" ? r.id : r.tenantId) === query.tenantId) && (!query.q || JSON.stringify(resource === "submissions" ? r.payload : r.name).toLowerCase().includes(query.q.toLowerCase())) && (!query.status || (resource === "tenants" ? query.status === "active" ? Number(r.activeFormCount) > 0 : Number(r.activeFormCount) === 0 : r.status === query.status)) && (resource !== "submissions" || ((!query.from || String(r.createdAt) >= query.from) && (!query.to || String(r.createdAt) <= query.to))));
@@ -259,11 +266,22 @@ async function createTestForm(store: MemoryStore) {
 }
 
 describe("contact form API", () => {
+  it("returns retry metadata and shares normalized account locks across portals", async () => {
+    const store = new MemoryStore(); const app = buildApp(config, store);
+    const headers = { origin: config.PUBLIC_BASE_URL };
+    for (let i = 0; i < 5; i++) await app.inject({ method: "POST", url: "/v1/admin/login", headers, payload: { email: "USER@example.com", password: "wrong", portal: "tenant" } });
+    const locked = await app.inject({ method: "POST", url: "/v1/admin/login", headers, payload: { email: " user@example.com ", password: "wrong", portal: "admin" } });
+    expect(locked.statusCode).toBe(429);
+    expect(Number(locked.headers["retry-after"])).toBeGreaterThan(0);
+    expect(locked.json()).toMatchObject({ code: "LOGIN_LOCKED", status: 429 });
+    expect((await app.inject({ url: "/" })).json()).toMatchObject({ service: "Contact API", version: "v1" });
+    await app.close();
+  });
   it("rate-limits a targeted login without locking out other accounts behind the frontend proxy", async () => {
     const store = new MemoryStore(); const app = buildApp(config, store);
     const headers = { origin: config.PUBLIC_BASE_URL };
-    for (let i = 0; i < 10; i++) expect((await app.inject({ method: "POST", url: "/v1/admin/login", headers, payload: { email: "target@example.com", password: "incorrect" } })).statusCode).toBe(401);
-    expect((await app.inject({ method: "POST", url: "/v1/admin/login", headers, payload: { email: "target@example.com", password: "incorrect" } })).statusCode).toBe(401);
+    for (let i = 0; i < 4; i++) expect((await app.inject({ method: "POST", url: "/v1/admin/login", headers, payload: { email: "target@example.com", password: "incorrect" } })).statusCode).toBe(401);
+    expect((await app.inject({ method: "POST", url: "/v1/admin/login", headers, payload: { email: "target@example.com", password: "incorrect" } })).statusCode).toBe(429);
     expect((await app.inject({ method: "POST", url: "/v1/auth/signup", headers, payload: { workspaceName: "Other studio", email: "other@example.com", password: "long-valid-password" } })).statusCode).toBe(202);
     expect((await app.inject({ method: "POST", url: "/v1/admin/login", headers, payload: { email: "other@example.com", password: "long-valid-password" } })).statusCode).toBe(200);
     await app.close();

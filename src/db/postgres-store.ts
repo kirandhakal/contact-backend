@@ -62,6 +62,24 @@ function mapDestination(row: pg.QueryResultRow): DestinationRecord {
 }
 
 export class PostgresStore implements Store {
+  async withLoginState<T>(key: string, action: (state: import("../login-lockout.js").LoginState) => Promise<T>): Promise<T> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("INSERT INTO login_lockouts(account_key) VALUES ($1) ON CONFLICT DO NOTHING", [key]);
+      const { rows } = await client.query("SELECT * FROM login_lockouts WHERE account_key = $1 FOR UPDATE", [key]);
+      const state = { failures: rows[0].failures, level: rows[0].level, lockedUntil: Number(rows[0].locked_until) };
+      const result = await action(state);
+      if (state.failures === 0 && state.level === 0) await client.query("DELETE FROM login_lockouts WHERE account_key = $1", [key]);
+      else await client.query("UPDATE login_lockouts SET failures=$2, level=$3, locked_until=$4 WHERE account_key=$1", [key, state.failures, state.level, state.lockedUntil]);
+      await client.query("COMMIT");
+      return result;
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally { client.release(); }
+  }
+
   private readonly pool: pg.Pool;
 
   constructor(databaseUrl: string) {

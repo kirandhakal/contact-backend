@@ -5,6 +5,11 @@ on:
     branches: [main]
  
   workflow_dispatch:
+    inputs:
+      seed_admin:
+        description: "Seed admin using SEED_ADMIN_EMAIL/PASSWORD in the server .env.docker"
+        type: boolean
+        default: false
 
 concurrency:
   group: production-deploy
@@ -92,12 +97,13 @@ jobs:
           IMAGE: ${{ env.IMAGE }}
           IMAGE_TAG: ${{ github.sha }}
           DEPLOY_PATH: ${{ env.DEPLOY_PATH }}
+          SEED_ADMIN: ${{ inputs.seed_admin || false }}
         with:
           host: ${{ secrets.HOST }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           command_timeout: 30m
-          envs: IMAGE,IMAGE_TAG,DEPLOY_PATH
+          envs: IMAGE,IMAGE_TAG,DEPLOY_PATH,SEED_ADMIN
           script_stop: false
           script: |
             set -euxo pipefail
@@ -110,6 +116,9 @@ jobs:
             sudo -n docker compose --env-file .env.docker config >/dev/null
             sudo -n docker compose --env-file .env.docker pull app worker
             sudo -n docker compose --env-file .env.docker run --rm app node dist/db/migrate.js
+            if [ "$SEED_ADMIN" = "true" ]; then
+              sudo -n docker compose --env-file .env.docker run --rm app node dist/db/seed-admin.js
+            fi
             sudo -n docker compose --env-file .env.docker up -d --force-recreate app worker
 
             HEALTHY=0

@@ -27,6 +27,18 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)("PostgreSQL management integrati
   afterAll(async () => {
     await store?.close(); if (pool) { await pool.query(`drop schema ${schema} cascade`); await pool.end(); }
   });
+  it("serializes concurrent login failures and persists across store instances", async () => {
+    const { checkLogin } = await import("../src/login-lockout.js");
+    const key = randomUUID();
+    const results = await Promise.all(Array.from({ length: 5 }, () => store.withLoginState(key, state => checkLogin(state, async () => false))));
+    expect(results.filter(result => result.retryAfterSeconds === 60)).toHaveLength(1);
+    const second = new PostgresStore(pool.options.connectionString!);
+    try {
+      const result = await second.withLoginState(key, state => checkLogin(state, async () => true));
+      expect(result.allowed).toBe(false);
+      expect(result.retryAfterSeconds).toBeGreaterThan(0);
+    } finally { await second.close(); }
+  });
   it("paginates SQL aggregates and preserves totals on out-of-range pages", async () => {
     const page = await store.managementPage("forms", { ...query, tenantId });
     expect(page.pagination.total).toBe(2); expect(page.items[0]).toMatchObject({ publicKey: key, submissionCount: 2, acceptedCount: 1, spamCount: 1 });

@@ -122,6 +122,7 @@ export interface OutboxJob {
 }
 
 export interface Store {
+  withLoginState<T>(key: string, action: (state: import("./login-lockout.js").LoginState) => Promise<T>): Promise<T>;
   managementPage(resource: "forms" | "tenants" | "submissions", query: import("./management.js").ListQuery, publicKey?: string): Promise<import("./management.js").PageResult>;
   analytics(tenantId?: string, from?: string, to?: string): Promise<JsonObject>;
   ready(): Promise<boolean>;

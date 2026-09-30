@@ -10,6 +10,7 @@
     "migrate": "tsx src/db/migrate.ts",
     "seed:admin": "tsx src/db/seed-admin.ts",
     "docker:up": "docker compose --env-file .env.docker up -d --build",
+    "docker:seed:admin": "docker compose --env-file .env.docker run --rm app node dist/db/seed-admin.js",
     "docker:migrate": "docker compose --env-file .env.docker run --rm app node dist/db/migrate.js",
     "docker:logs": "docker compose --env-file .env.docker logs -f app worker",
     "docker:down": "docker compose --env-file .env.docker down",
