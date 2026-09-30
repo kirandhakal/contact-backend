@@ -1,4 +1,5 @@
 import pg from "pg";
+import { encryptDestination, decryptDestination } from "../integrations.js";
 import { tenantSlug } from "../tenant-name.js";
 import type { ListQuery, PageResult } from "../management.js";
 import type {
@@ -51,13 +52,12 @@ function mapSubmission(row: pg.QueryResultRow): SubmissionRecord {
   };
 }
 
-function mapDestination(row: pg.QueryResultRow): DestinationRecord {
+function mapDestination(row: pg.QueryResultRow, key: string): DestinationRecord {
   return {
     id: row.destination_id ?? row.id,
     formId: row.destination_form_id ?? row.form_id,
     kind: row.kind,
-    config: row.config,
-    secret: row.secret,
+    ...decryptDestination(row.config, row.secret, key),
     active: row.active
   };
 }
@@ -82,7 +82,7 @@ export class PostgresStore implements Store {
 
   private readonly pool: pg.Pool;
 
-  constructor(databaseUrl: string) {
+  constructor(databaseUrl: string, private readonly encryptionKey = process.env.DATA_ENCRYPTION_KEY ?? "") {
     this.pool = new Pool({ connectionString: databaseUrl });
   }
 
@@ -142,7 +142,7 @@ export class PostgresStore implements Store {
       for (const destination of input.destinations ?? []) {
         await client.query(
           "insert into destinations(form_id, kind, config, secret, active) values($1, $2, $3, $4, true)",
-          [form.rows[0].id, destination.kind, destination.config, destination.secret ?? null]
+          [form.rows[0].id, destination.kind, encryptDestination(destination, this.encryptionKey), null]
         );
       }
       await client.query("commit");
@@ -180,7 +180,12 @@ export class PostgresStore implements Store {
     return result.rowCount ? mapForm(result.rows[0]) : null;
   }
 
-  async updateForm(publicKey: string, input: Partial<Pick<CreateFormInput, "name" | "allowedOrigins" | "successMessage" | "schema">> & { status?: "active" | "disabled" }): Promise<FormRecord | null> {
+  async getFormDestinations(publicKey: string): Promise<DestinationRecord[]> {
+    const result = await this.pool.query("SELECT d.* FROM destinations d JOIN forms f ON f.id=d.form_id WHERE f.public_key=$1 AND d.active=true ORDER BY d.id", [publicKey]);
+    return result.rows.map(row => mapDestination(row, this.encryptionKey));
+  }
+
+  async updateForm(publicKey: string, input: Partial<Pick<CreateFormInput, "name" | "allowedOrigins" | "successMessage" | "schema" | "destinations">> & { status?: "active" | "disabled" }): Promise<FormRecord | null> {
     const client = await this.pool.connect();
     try {
       await client.query("begin");
@@ -192,6 +197,14 @@ export class PostgresStore implements Store {
         [publicKey, input.name ?? null, input.allowedOrigins ?? null, input.successMessage ?? null, input.status ?? null]
       );
       if (!updated.rowCount) { await client.query("rollback"); return null; }
+      if (input.destinations !== undefined) {
+        // Retain old destinations for already queued deliveries; new submissions use the new settings.
+        await client.query("UPDATE destinations SET active=false WHERE form_id=$1", [updated.rows[0].id]);
+        for (const destination of input.destinations) {
+          await client.query("INSERT INTO destinations(form_id,kind,config,secret,active) VALUES($1,$2,$3,NULL,true)",
+            [updated.rows[0].id, destination.kind, encryptDestination(destination, this.encryptionKey)]);
+        }
+      }
       let version: number;
       let schema: JsonObject;
       const current = await client.query("select version, schema from form_versions where form_id = $1 order by version desc limit 1", [updated.rows[0].id]);
@@ -588,14 +601,15 @@ export class PostgresStore implements Store {
           claimed.active`,
         [limit]
       );
-      await client.query("commit");
-      return result.rows.map((row) => ({
+      const jobs = result.rows.map((row) => ({
         id: row.id,
         attempts: Number(row.attempts),
         submission: mapSubmission(row),
         form: { id: row.form_id, name: row.form_name },
-        destination: mapDestination(row)
+        destination: mapDestination(row, this.encryptionKey)
       }));
+      await client.query("commit");
+      return jobs;
     } catch (error) {
       await client.query("rollback");
       throw error;

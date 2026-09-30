@@ -35,6 +35,8 @@ const config = {
 };
 
 class MemoryStore implements Store {
+  destinations = new Map<string, import("../src/types.js").DestinationRecord[]>();
+  async getFormDestinations(key: string) { return this.destinations.get(key) ?? []; }
   loginStates = new Map<string, import("../src/login-lockout.js").LoginState>();
   async withLoginState<T>(key: string, action: (state: import("../src/login-lockout.js").LoginState) => Promise<T>): Promise<T> {
     const state = this.loginStates.get(key) ?? { failures: 0, level: 0, lockedUntil: 0 };
@@ -115,6 +117,7 @@ class MemoryStore implements Store {
     if (input.successMessage) form.successMessage = input.successMessage;
     if (input.schema) { form.schema = input.schema as JsonObject; form.version += 1; }
     if (input.status) form.status = input.status;
+    if (input.destinations) this.destinations.set(publicKey, input.destinations.map(d => ({ ...d, id: randomUUID(), formId: form.id, active: true })));
     return form;
   }
   async getTenantIdForSubmission(submissionId: string) { return this.submissions.find((item) => item.id === submissionId)?.tenantId ?? null; }
@@ -142,6 +145,7 @@ class MemoryStore implements Store {
       schema: input.schema as JsonObject
     };
     this.forms.set(publicKey, form);
+    this.destinations.set(publicKey, (input.destinations ?? []).map(d => ({ ...d, id: randomUUID(), formId: form.id, active: true })));
     return form;
   }
 
@@ -431,6 +435,32 @@ describe("contact form API", () => {
     expect(invalid.statusCode).toBe(422);
   });
 
+  it("manages integrations without exposing secrets and preserves credentials on edits", async () => {
+    const store = new MemoryStore(); const app = buildApp(config, store);
+    const headers = { authorization: `Bearer ${config.ADMIN_API_KEY}` };
+    const created = await app.inject({ method: "POST", url: "/v1/admin/forms", headers, payload: {
+      tenantName: "Studio", name: "Contact", allowedOrigins: ["https://example.com"], schema: { type: "object", properties: { name: { type: "string" } } },
+      destinations: [{ kind: "discord", config: { template: "Hello {{name}}" }, secret: "https://discord.com/api/webhooks/123/token" }]
+    } });
+    expect(created.statusCode).toBe(201);
+    const path = `/v1/admin/forms/${created.json().publicKey}`;
+    expect((await app.inject({ url: `${path}/destinations` })).statusCode).toBe(401);
+    const list = await app.inject({ url: `${path}/destinations`, headers });
+    expect(list.body).not.toContain("/123/token");
+    const destination = list.json().destinations[0];
+    expect(destination.hasSecret).toBe(true);
+    const updated = await app.inject({ method: "PATCH", url: path, headers, payload: { destinations: [{ id: destination.id, kind: destination.kind, config: { template: "Updated {{name}}" } }] } });
+    expect(updated.statusCode).toBe(200);
+    expect((await store.getFormDestinations(created.json().publicKey))[0].secret).toBe("https://discord.com/api/webhooks/123/token");
+    const publicForm = await app.inject({ url: `/v1/forms/${created.json().publicKey}`, headers: { origin: "https://example.com" } });
+    expect(publicForm.body).not.toContain("destinations");
+    expect(publicForm.body).not.toContain("/123/token");
+    const signup = await app.inject({ method: "POST", url: "/v1/auth/signup", headers: { origin: config.PUBLIC_BASE_URL }, payload: { workspaceName: "Other", email: "integrations@example.com", password: "integration-password" } });
+    expect(signup.statusCode).toBe(202);
+    const login = await app.inject({ method: "POST", url: "/v1/admin/login", headers: { origin: config.PUBLIC_BASE_URL }, payload: { email: "integrations@example.com", password: "integration-password" } });
+    expect((await app.inject({ url: `${path}/destinations`, headers: { cookie: login.headers["set-cookie"] as string } })).statusCode).toBe(404);
+    await app.close();
+  });
   it("signs up a customer workspace and lets its owner create forms", async () => {
     const store = new MemoryStore();
     const app = buildApp(config, store);

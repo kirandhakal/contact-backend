@@ -1,7 +1,7 @@
 import type { JSONSchemaType } from "ajv";
 
 export type JsonObject = Record<string, unknown>;
-export type DestinationKind = "email" | "webhook";
+export type DestinationKind = "email" | "webhook" | "sms" | "discord";
 export type SubmissionStatus = "accepted" | "spam" | "deleted";
 export type AdminRole = "sudo" | "super" | "tenant";
 
@@ -122,6 +122,7 @@ export interface OutboxJob {
 }
 
 export interface Store {
+  getFormDestinations(publicKey: string): Promise<DestinationRecord[]>;
   withLoginState<T>(key: string, action: (state: import("./login-lockout.js").LoginState) => Promise<T>): Promise<T>;
   managementPage(resource: "forms" | "tenants" | "submissions", query: import("./management.js").ListQuery, publicKey?: string): Promise<import("./management.js").PageResult>;
   analytics(tenantId?: string, from?: string, to?: string): Promise<JsonObject>;
@@ -154,7 +155,7 @@ export interface Store {
   getTenantLimits(tenantId: string): Promise<TenantUsage | null>;
   updateTenantLimits(tenantId: string, limits: TenantLimits): Promise<boolean>;
   getForm(publicKey: string): Promise<FormRecord | null>;
-  updateForm(publicKey: string, input: Partial<Pick<CreateFormInput, "name" | "allowedOrigins" | "successMessage" | "schema">> & { status?: "active" | "disabled" }): Promise<FormRecord | null>;
+  updateForm(publicKey: string, input: Partial<Pick<CreateFormInput, "name" | "allowedOrigins" | "successMessage" | "schema" | "destinations">> & { status?: "active" | "disabled" }): Promise<FormRecord | null>;
   updateSubmission(submissionId: string, payload: JsonObject, status: SubmissionStatus): Promise<boolean>;
   getTenantIdForSubmission(submissionId: string): Promise<string | null>;
   getTenantIdForForm(publicKey: string): Promise<string | null>;

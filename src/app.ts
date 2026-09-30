@@ -1,3 +1,4 @@
+import { validateDestinations } from "./integrations.js";
 import { tenantSlug } from "./tenant-name.js";
 import { checkLogin } from "./login-lockout.js";
 import { createRequire } from "node:module";
@@ -121,9 +122,9 @@ const validateCreateForm = createFormAjv.compile({
         additionalProperties: false,
         required: ["kind", "config"],
         properties: {
-          kind: { enum: ["email", "webhook"] },
+          kind: { enum: ["email", "webhook", "sms", "discord"] },
           config: { type: "object" },
-          secret: { type: "string", minLength: 24 }
+          secret: { type: "string", maxLength: 4096 }
         }
       }
     }
@@ -465,13 +466,8 @@ export function buildApp(config: AppConfig, store: Store) {
         return problem(reply, 422, "Validation failed", "Allowed origins must be exact HTTP or HTTPS origins.");
       }
     }
-    for (const destination of input.destinations ?? []) {
-      if (destination.kind === "webhook" && !isSafeWebhookUrl(destination.config.url)) {
-        return problem(reply, 422, "Validation failed", "Webhook destinations require a safe HTTPS URL.");
-      }
-      if (destination.kind === "webhook" && (!destination.secret || destination.secret.length < 24)) return problem(reply, 422, "Validation failed", "Webhooks require a signing secret of at least 24 characters.");
-      if (destination.kind === "email" && !z.string().email().safeParse(destination.config.to).success) return problem(reply, 422, "Validation failed", "Email destinations require a valid recipient.");
-    }
+    try { input.destinations = validateDestinations(input.destinations ?? [], input.schema as JsonObject); }
+    catch (error) { return problem(reply, 422, "Invalid integration", error instanceof z.ZodError ? "Check integration settings, recipients, and templates." : (error as Error).message); }
     if (!isBoundedJsonSchema(input.schema) || !schemaAjv.validateSchema(input.schema)) {
       return problem(reply, 422, "Validation failed", "JSON Schema is invalid.", {
         errors: validationErrors(schemaAjv.errors)
@@ -526,6 +522,15 @@ export function buildApp(config: AppConfig, store: Store) {
     return { forms: admin.role === "tenant" ? forms.filter((form) => form.tenantId === admin.tenantId) : forms };
   });
 
+  app.get<{ Params: { publicKey: string } }>("/v1/admin/forms/:publicKey/destinations", async (request, reply) => {
+    const actor = await adminFor(request);
+    if (!actor) return problem(reply, 401, "Unauthorized", "Sign in required.");
+    const tenantId = await store.getTenantIdForForm(request.params.publicKey);
+    if (!tenantId || (actor.role === "tenant" && actor.tenantId !== tenantId)) return problem(reply, 404, "Not found", "Form not found.");
+    const destinations = await store.getFormDestinations(request.params.publicKey);
+    return { destinations: destinations.map(({ id, kind, config, secret }) => ({ id, kind, config, hasSecret: !!secret })) };
+  });
+
   app.patch<{ Params: { publicKey: string } }>("/v1/admin/forms/:publicKey", async (request, reply) => {
     const admin = await adminFor(request);
     if (!admin) return problem(reply, 401, "Unauthorized", "Sign in required.");
@@ -535,7 +540,7 @@ export function buildApp(config: AppConfig, store: Store) {
       return problem(reply, 404, "Not found", "Form not found.");
     }
     if (!assertPlainObject(request.body)) return problem(reply, 400, "Invalid request", "Form changes are required.");
-    const changes: Partial<Pick<CreateFormInput, "name" | "allowedOrigins" | "successMessage" | "schema">> & { status?: "active" | "disabled" } = {};
+    const changes: Partial<Pick<CreateFormInput, "name" | "allowedOrigins" | "successMessage" | "schema" | "destinations">> & { status?: "active" | "disabled" } = {};
     if (request.body.status !== undefined) {
       if (!["active", "disabled"].includes(String(request.body.status))) return problem(reply, 422, "Invalid request", "Status must be active or disabled.");
       changes.status = request.body.status as "active" | "disabled";
@@ -559,6 +564,16 @@ export function buildApp(config: AppConfig, store: Store) {
     if (request.body.schema !== undefined) {
       if (!assertPlainObject(request.body.schema) || !isBoundedJsonSchema(request.body.schema) || !schemaAjv.validateSchema(request.body.schema)) return problem(reply, 422, "Validation failed", "JSON Schema is invalid or too complex.");
       changes.schema = request.body.schema;
+    }
+    if (request.body.destinations !== undefined) {
+      const current = await store.getForm(request.params.publicKey);
+      try { changes.destinations = validateDestinations(request.body.destinations, changes.schema ?? current!.schema, await store.getFormDestinations(request.params.publicKey)); }
+      catch (error) { return problem(reply, 422, "Invalid integration", error instanceof z.ZodError ? "Check integration settings, recipients, and templates." : (error as Error).message); }
+    } else if (changes.schema) {
+      try {
+        const existing = await store.getFormDestinations(request.params.publicKey);
+        validateDestinations(existing.map(({ kind, config, secret }) => ({ kind, config, secret: secret ?? undefined })), changes.schema);
+      } catch { return problem(reply, 422, "Invalid integration", "Update your integration recipient fields and templates to match the new form fields."); }
     }
     if (!Object.keys(changes).length) return problem(reply, 422, "Invalid request", "No supported form changes were supplied.");
     const form = await store.updateForm(request.params.publicKey, changes);

@@ -19,7 +19,7 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)("PostgreSQL management integrati
     const setup = new pg.Client({ connectionString: url.toString() }); await setup.connect();
     await setup.query(`create schema ${schema}`); await setup.end();
     url.searchParams.set("options", `-c search_path=${schema},public`);
-    pool = new pg.Pool({ connectionString: url.toString() }); store = new PostgresStore(url.toString());
+    pool = new pg.Pool({ connectionString: url.toString() }); store = new PostgresStore(url.toString(), "b".repeat(64));
     for (let pass = 0; pass < 2; pass++) for (const file of (await readdir(new URL("../migrations/", import.meta.url))).filter(f => f.endsWith(".sql")).sort()) await pool.query(await readFile(new URL(`../migrations/${file}`, import.meta.url), "utf8"));
     tenantId = (await store.createSiteAccount("SQL studio", `${schema}@example.com`, await hashPassword("original-password"))).tenantId;
     key = `cf_${randomUUID()}`;
@@ -58,6 +58,27 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)("PostgreSQL management integrati
     const key = randomUUID();
     const results = await Promise.all(Array.from({ length: 20 }, () => store.withLoginState(key, state => checkLogin(state, async () => true))));
     expect(results.every(result => result.allowed)).toBe(true);
+  });
+  it("encrypts integration credentials, decrypts worker jobs, and atomically replaces destinations", async () => {
+    const tenant = await store.createTenant("Integration tests");
+    const publicKey = `frm_${randomUUID()}`;
+    try {
+      const form = await store.createForm({ tenantName: "Integration tests", tenantId: tenant, name: "Notifications", allowedOrigins: ["https://example.com"], schema: { type: "object" },
+        destinations: [{ kind: "discord", config: { template: "New {{form.name}}" }, secret: "https://discord.com/api/webhooks/123/private-token" }] }, publicKey);
+      const raw = await pool.query("SELECT config,secret FROM destinations WHERE form_id=$1", [form.id]);
+      expect(JSON.stringify(raw.rows)).not.toContain("private-token");
+      expect(raw.rows[0].secret).toBeNull();
+      expect((await store.getFormDestinations(publicKey))[0].secret).toContain("private-token");
+      await store.createSubmission({ form, payload: {}, status: "accepted", sourceIpHash: "test", accessTokenHash: "token", expiresAt: new Date(Date.now() + 60000) });
+      await store.updateForm(publicKey, { destinations: [] });
+      expect(await store.getFormDestinations(publicKey)).toEqual([]);
+      const jobs = await store.claimJobs(10);
+      expect(jobs).toHaveLength(1);
+      expect(jobs[0].destination.secret).toContain("private-token");
+      await store.markJobDelivered(jobs[0].id);
+      await store.createSubmission({ form, payload: {}, status: "accepted", sourceIpHash: "test", accessTokenHash: "token2", expiresAt: new Date(Date.now() + 60000) });
+      expect(await store.claimJobs(10)).toEqual([]);
+    } finally { await pool.query("DELETE FROM tenants WHERE id=$1", [tenant]); }
   });
   it("serializes concurrent login failures and persists across store instances", async () => {
     const { checkLogin } = await import("../src/login-lockout.js");

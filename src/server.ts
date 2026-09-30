@@ -4,7 +4,7 @@ import { buildApp } from "./app.js";
 import { PostgresStore } from "./db/postgres-store.js";
 
 const config = getConfig();
-const store = new PostgresStore(config.DATABASE_URL);
+const store = new PostgresStore(config.DATABASE_URL, config.DATA_ENCRYPTION_KEY);
 const app = buildApp(config, store);
 
 const shutdown = async () => {

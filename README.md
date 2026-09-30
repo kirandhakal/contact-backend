@@ -56,3 +56,17 @@ identical responses. PostgreSQL persists and serializes these counters across
 application instances. Apply migrations before starting the updated app.
 HTTP 429 includes `Retry-After`, `retryAfterSeconds`, and `lockedUntil`;
 the frontend displays a countdown and disables submission until it expires.
+
+### Signup and schema readiness
+
+Successful signup redirects the web app to `/login?signup=complete`; it does not
+attempt an automatic login. Users sign in explicitly after the confirmation.
+New workspace/tenant names are normalized with `slugify` (for example,
+`Acme Studio` becomes `acme-studio`). Names that produce an empty slug are rejected.
+Existing tenant names are preserved.
+
+The API now applies migrations before listening, including the login-lockout table.
+Migrations run in one transaction under a PostgreSQL advisory lock so simultaneous
+API starts cannot apply them concurrently. A migration failure is logged and stops
+startup instead of allowing signup while login tables are missing. The database
+user therefore needs the same schema permissions as the migration command.
