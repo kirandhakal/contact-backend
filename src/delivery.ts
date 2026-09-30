@@ -13,7 +13,7 @@ export async function deliverJob(job: OutboxJob, config: AppConfig): Promise<voi
 }
 
 async function deliverEmail(job: OutboxJob, config: AppConfig): Promise<void> {
-  if (!config.SMTP_URL) return;
+  if (!config.SMTP_URL) throw new Error("SMTP is not configured; email delivery cannot complete");
   const to = job.destination.config.to;
   if (typeof to !== "string" || !to) throw new Error("email destination requires config.to");
   const transporter = nodemailer.createTransport(config.SMTP_URL);

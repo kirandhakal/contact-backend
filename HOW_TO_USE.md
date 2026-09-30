@@ -192,12 +192,44 @@ Open:
 http://localhost:8080/contact-form.html
 ```
 
-## 10. View Submissions
+## 10. Admin accounts and dashboard
+
+Run `npm run migrate` after updating an existing installation. The contact service hosts the admin dashboard at the origin in `PUBLIC_BASE_URL`, followed by `/admin` (for example, `http://localhost:3100/admin`). Use the exact same host name as `PUBLIC_BASE_URL` when signing in.
+
+The backend operator's `ADMIN_API_KEY` is a bootstrap credential. Keep it on the contact server. `npm run seed:admin` creates the first `sudo` admin. Existing installations are migrated automatically: the oldest service admin becomes `sudo`, other service admins become `super`, and site admins become `tenant` admins.
+
+```bash
+curl -X POST http://localhost:3100/v1/admin/users \
+  -H "Authorization: Bearer YOUR_ADMIN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"email":"operator@example.com","password":"a-unique-password-at-least-12-chars","role":"super"}'
+```
+
+Sudo and super admins sign in at `/admin`; tenant admins use `/auth`. Sudo can create super and tenant accounts, edit all forms and submissions, and change their password. Super admins can edit forms and manage enforced tenant allowances. Tenant admins can edit forms and review submissions belonging to their tenant.
+
+To create a tenant admin for an existing tenant, supply its tenant ID (or use a registered form key):
+
+```bash
+curl -X POST http://localhost:3100/v1/admin/users \
+  -H "Authorization: Bearer YOUR_ADMIN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"email":"site-owner@example.com","password":"a-different-long-password","role":"tenant","formKey":"YOUR_PUBLIC_KEY"}'
+```
+
+Tenant admins see submissions and counts for their tenant only. Give each administrator an individual account. A public form key is safe to include in a static frontend; passwords and `ADMIN_API_KEY` are not. Tenant limits cover origins per form, total forms, total submissions, and daily submissions; all four are enforced by the API.
+
+To add another form for an existing site, pass its `tenantId` in the form creation request along with the usual form fields. The service admin can find the tenant ID in `/v1/admin/forms/summary`. Forms with the same `tenantId` appear together for that site's admins. Omit `tenantId` to create a new site tenant.
+
+The dashboard is hosted on the contact service origin and uses an HttpOnly, SameSite=Strict session cookie. Login is rate limited. Sessions expire after 8 hours and can be ended with Sign out. Use HTTPS for production.
+
+## 11. Admin API
 
 ```bash
 curl http://localhost:3100/v1/admin/forms/YOUR_PUBLIC_KEY/submissions \
   -H "Authorization: Bearer YOUR_ADMIN_API_KEY"
 ```
+
+Public submissions return only a status and confirmation message. The visitor does not get a read credential. The static site can display its own success message instead of the API message.
 
 ## 11. Compare frontend traffic
 

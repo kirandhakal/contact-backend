@@ -1,6 +1,8 @@
 import pg from "pg";
+import type { ListQuery, PageResult } from "../management.js";
 import type {
   CreateFormInput,
+  AdminRole,
   DestinationRecord,
   FormSummary,
   FormRecord,
@@ -9,7 +11,10 @@ import type {
   Store,
   SubmissionRecord,
   SubmissionResult,
-  SubmissionStatus
+  SubmissionStatus,
+  TenantLimits,
+  TenantSummary,
+  TenantUsage
 } from "../types.js";
 
 const { Pool } = pg;
@@ -72,11 +77,33 @@ export class PostgresStore implements Store {
     }
   }
 
+  async createSiteAccount(tenantName: string, email: string, passwordHash: string): Promise<{ tenantId: string }> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("begin");
+      const tenant = await client.query("insert into tenants(name) values($1) returning id", [tenantName]);
+      await client.query(
+        "insert into admin_users(email, password_hash, role, tenant_id) values($1, $2, 'tenant', $3)",
+        [email, passwordHash, tenant.rows[0].id]
+      );
+      await client.query("commit");
+      return { tenantId: tenant.rows[0].id as string };
+    } catch (error) {
+      await client.query("rollback");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
   async createForm(input: CreateFormInput, publicKey: string): Promise<FormRecord> {
     const client = await this.pool.connect();
     try {
       await client.query("begin");
-      const tenant = await client.query("insert into tenants(name) values($1) returning id", [input.tenantName]);
+      const tenant = input.tenantId
+        ? await client.query("select id from tenants where id = $1", [input.tenantId])
+        : await client.query("insert into tenants(name) values($1) returning id", [input.tenantName]);
+      if (!tenant.rowCount) throw new Error("Tenant not found");
       const form = await client.query(
         `insert into forms(tenant_id, public_key, name, allowed_origins, success_message, honeypot_field)
          values($1, $2, $3, $4, $5, $6)
@@ -126,6 +153,46 @@ export class PostgresStore implements Store {
     return result.rowCount ? mapForm(result.rows[0]) : null;
   }
 
+  async getForm(publicKey: string): Promise<FormRecord | null> {
+    const result = await this.pool.query(
+      `select f.*, fv.version, fv.schema from forms f
+       join lateral (select version, schema from form_versions where form_id = f.id order by version desc limit 1) fv on true
+       where f.public_key = $1`, [publicKey]
+    );
+    return result.rowCount ? mapForm(result.rows[0]) : null;
+  }
+
+  async updateForm(publicKey: string, input: Partial<Pick<CreateFormInput, "name" | "allowedOrigins" | "successMessage" | "schema">> & { status?: "active" | "disabled" }): Promise<FormRecord | null> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("begin");
+      const updated = await client.query(
+        `update forms set
+          name = coalesce($2, name), allowed_origins = coalesce($3, allowed_origins),
+          success_message = coalesce($4, success_message), status = coalesce($5, status)
+         where public_key = $1 returning *`,
+        [publicKey, input.name ?? null, input.allowedOrigins ?? null, input.successMessage ?? null, input.status ?? null]
+      );
+      if (!updated.rowCount) { await client.query("rollback"); return null; }
+      let version: number;
+      let schema: JsonObject;
+      const current = await client.query("select version, schema from form_versions where form_id = $1 order by version desc limit 1", [updated.rows[0].id]);
+      if (input.schema) {
+        version = Number(current.rows[0].version) + 1;
+        schema = input.schema as JsonObject;
+        await client.query("insert into form_versions(form_id, version, schema) values($1, $2, $3)", [updated.rows[0].id, version, schema]);
+      } else {
+        version = Number(current.rows[0].version);
+        schema = current.rows[0].schema as JsonObject;
+      }
+      await client.query("commit");
+      return mapForm({ ...updated.rows[0], version, schema });
+    } catch (error) {
+      await client.query("rollback");
+      throw error;
+    } finally { client.release(); }
+  }
+
   async createSubmission(args: {
     form: FormRecord;
     payload: JsonObject;
@@ -133,6 +200,7 @@ export class PostgresStore implements Store {
     sourceOrigin?: string;
     sourceIpHash: string;
     idempotencyKey?: string;
+    accessTokenHash: string;
     expiresAt: Date;
   }): Promise<SubmissionResult> {
     const client = await this.pool.connect();
@@ -150,8 +218,8 @@ export class PostgresStore implements Store {
       }
 
       const inserted = await client.query(
-        `insert into submissions(tenant_id, form_id, form_version, payload, status, source_origin, source_ip_hash, idempotency_key, expires_at)
-         values($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        `insert into submissions(tenant_id, form_id, form_version, payload, status, source_origin, source_ip_hash, idempotency_key, access_token_hash, expires_at)
+         values($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
          returning *`,
         [
           args.form.tenantId,
@@ -162,6 +230,7 @@ export class PostgresStore implements Store {
           args.sourceOrigin ?? null,
           args.sourceIpHash,
           args.idempotencyKey ?? null,
+          args.accessTokenHash,
           args.expiresAt
         ]
       );
@@ -182,6 +251,183 @@ export class PostgresStore implements Store {
     }
   }
 
+  async getSubmissionByAccessToken(submissionId: string, accessTokenHash: string) {
+    const result = await this.pool.query(
+      `select s.*, f.allowed_origins
+       from submissions s
+       join forms f on f.id = s.form_id
+       where s.id = $1 and s.access_token_hash = $2 and s.status <> 'deleted' and s.expires_at > now()`,
+      [submissionId, accessTokenHash]
+    );
+    return result.rowCount
+      ? { submission: mapSubmission(result.rows[0]), allowedOrigins: result.rows[0].allowed_origins as string[] }
+      : null;
+  }
+
+  async createAdmin(email: string, passwordHash: string, role: AdminRole, tenantId: string | null): Promise<void> {
+    await this.pool.query(
+      "insert into admin_users(email, password_hash, role, tenant_id) values($1, $2, $3, $4)",
+      [email, passwordHash, role, tenantId]
+    );
+  }
+
+  async getAdminByEmail(email: string) {
+    const result = await this.pool.query("select id, email, password_hash, role, tenant_id from admin_users where email = $1", [email]);
+    if (!result.rowCount) return null;
+    const row = result.rows[0];
+    return { id: row.id as string, email: row.email as string, passwordHash: row.password_hash as string, role: row.role as AdminRole, tenantId: row.tenant_id as string | null };
+  }
+
+  async createAdminSession(adminId: string, tokenHash: string, expiresAt: Date): Promise<void> {
+    await this.pool.query("insert into admin_sessions(token_hash, admin_id, expires_at) values($1, $2, $3)", [tokenHash, adminId, expiresAt]);
+  }
+
+  async getAdminBySession(tokenHash: string) {
+    const result = await this.pool.query(
+      `select u.id, u.email, u.role, u.tenant_id from admin_sessions s
+       join admin_users u on u.id = s.admin_id where s.token_hash = $1 and s.expires_at > now()`, [tokenHash]
+    );
+    if (!result.rowCount) return null;
+    const row = result.rows[0];
+    return { id: row.id as string, email: row.email as string, role: row.role as AdminRole, tenantId: row.tenant_id as string | null };
+  }
+
+  async updateAdminPassword(adminId: string, passwordHash: string): Promise<void> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("begin");
+      await client.query("update admin_users set password_hash = $2 where id = $1", [adminId, passwordHash]);
+      await client.query("delete from admin_sessions where admin_id = $1", [adminId]);
+      await client.query("commit");
+    } catch (error) { await client.query("rollback"); throw error; }
+    finally { client.release(); }
+  }
+
+  async managementPage(resource: "forms" | "tenants" | "submissions", query: ListQuery, publicKey?: string): Promise<PageResult> {
+    const values: unknown[] = [];
+    const bind = (value: unknown) => { values.push(value); return `$${values.length}`; };
+    const where: string[] = [];
+    let source: string;
+    if (resource === "submissions") {
+      where.push(`f.public_key = ${bind(publicKey)}`, "s.status <> 'deleted'");
+      if (query.tenantId) where.push(`s.tenant_id = ${bind(query.tenantId)}`);
+      if (query.status) where.push(`s.status = ${bind(query.status)}`);
+      if (query.q) where.push(`s.payload::text ilike ${bind(`%${query.q}%`)}`);
+      if (query.from) where.push(`s.created_at >= ${bind(query.from)}::timestamptz`);
+      if (query.to) where.push(`s.created_at <= ${bind(query.to)}::timestamptz`);
+      source = `select s.id, s.created_at, '' as name, 0 as usage, jsonb_build_object('id',s.id,'payload',s.payload,'status',s.status,'createdAt',s.created_at,'sourceOrigin',s.source_origin) as item from submissions s join forms f on f.id=s.form_id where ${where.join(" and ")}`;
+    } else if (resource === "forms") {
+      if (query.tenantId) where.push(`f.tenant_id = ${bind(query.tenantId)}`);
+      if (query.status) where.push(`f.status = ${bind(query.status)}`);
+      if (query.q) where.push(`(f.name ilike ${bind(`%${query.q}%`)} or f.public_key ilike $${values.length})`);
+      const dates = ["s.form_id=f.id", "s.status <> 'deleted'"];
+      if (query.from) dates.push(`s.created_at >= ${bind(query.from)}::timestamptz`);
+      if (query.to) dates.push(`s.created_at <= ${bind(query.to)}::timestamptz`);
+      source = `select f.id, f.created_at, f.name, stats.total as usage,
+        jsonb_build_object('publicKey',f.public_key,'tenantId',f.tenant_id,'tenantName',t.name,'name',f.name,'status',f.status,'allowedOrigins',f.allowed_origins,'submissionCount',stats.total,'acceptedCount',stats.accepted,'spamCount',stats.spam,'lastSubmittedAt',stats.last_at,'schema',v.schema,'successMessage',f.success_message) as item
+        from forms f join tenants t on t.id=f.tenant_id
+        join lateral (select schema from form_versions where form_id=f.id order by version desc limit 1) v on true
+        cross join lateral (select count(*)::int total, count(*) filter(where s.status='accepted')::int accepted, count(*) filter(where s.status='spam')::int spam, max(s.created_at) last_at from submissions s where ${dates.join(" and ")}) stats
+        ${where.length ? `where ${where.join(" and ")}` : ""}`;
+    } else {
+      if (query.tenantId) where.push(`t.id = ${bind(query.tenantId)}`);
+      if (query.q) where.push(`t.name ilike ${bind(`%${query.q}%`)}`);
+      if (query.status) where.push(`${query.status === "inactive" ? "not " : ""}exists(select 1 from forms where tenant_id=t.id and status='active')`);
+      source = `select t.id,t.created_at,t.name,stats.total as usage,
+        jsonb_build_object('id',t.id,'name',t.name,'createdAt',t.created_at,'formCount',(select count(*) from forms where tenant_id=t.id),'activeFormCount',(select count(*) from forms where tenant_id=t.id and status='active'),'totalSubmissions',stats.total,'dailySubmissions',stats.daily,'maxForms',t.max_forms,'maxOriginsPerForm',t.max_origins_per_form,'maxTotalSubmissions',t.max_total_submissions,'maxDailySubmissions',t.max_daily_submissions) as item
+        from tenants t cross join lateral (select count(*)::int total, count(*) filter(where created_at >= date_trunc('day',now()))::int daily from submissions where tenant_id=t.id and status <> 'deleted') stats
+        ${where.length ? `where ${where.join(" and ")}` : ""}`;
+    }
+    const order = { newest: "created_at desc,id", oldest: "created_at asc,id", name: "name asc,id", "most-used": "usage desc,id" }[query.sort];
+    const limit = bind(query.limit), offset = bind((query.page - 1) * query.limit);
+    const result = await this.pool.query(`with filtered as (${source}), page as (select * from filtered order by ${order} limit ${limit} offset ${offset}) select (select count(*)::int from filtered) total, coalesce((select jsonb_agg(item order by ${order}) from page),'[]'::jsonb) items`, values);
+    const { items, total } = result.rows[0];
+    return { items, pagination: { page: query.page, limit: query.limit, total, pages: Math.ceil(total / query.limit) } };
+  }
+
+  async analytics(tenantId?: string, from?: string, to?: string): Promise<JsonObject> {
+    const result = await this.pool.query(`with scoped_forms as (select * from forms where ($1::uuid is null or tenant_id=$1)), scoped_submissions as (
+      select s.* from submissions s join scoped_forms f on f.id=s.form_id where s.status <> 'deleted' and ($2::timestamptz is null or s.created_at >= $2) and ($3::timestamptz is null or s.created_at <= $3)
+    ) select jsonb_build_object(
+      'forms',(select count(*) from scoped_forms),
+      'activeForms',(select count(*) from scoped_forms where status='active'),
+      'tenants',(select count(*) from tenants where ($1::uuid is null or id=$1)),
+      'activeTenants',(select count(distinct tenant_id) from scoped_forms where status='active'),
+      'submissions',(select count(*) from scoped_submissions),
+      'accepted',(select count(*) from scoped_submissions where status='accepted'),
+      'spam',(select count(*) from scoped_submissions where status='spam'),
+      'mostUsedForms',coalesce((select jsonb_agg(row_to_json(top_forms)) from (select f.public_key as "publicKey", f.name, count(s.id)::int as "submissionCount" from scoped_forms f left join scoped_submissions s on s.form_id=f.id group by f.id,f.public_key,f.name order by count(s.id) desc,f.id limit 10) top_forms),'[]'::jsonb),
+      'daily',coalesce((select jsonb_agg(row_to_json(days)) from (select to_char(created_at at time zone 'UTC','YYYY-MM-DD') as day,count(*)::int as count from scoped_submissions group by day order by day) days),'[]'::jsonb)
+    ) as data`, [tenantId ?? null, from ?? null, to ?? null]);
+    return result.rows[0].data;
+  }
+
+  async createTenant(name: string): Promise<string> {
+    const result = await this.pool.query("insert into tenants(name) values($1) returning id", [name]);
+    return result.rows[0].id as string;
+  }
+
+  async listTenants(): Promise<TenantSummary[]> {
+    const result = await this.pool.query(
+      `select t.*, count(distinct f.id)::int form_count,
+        count(s.id) filter (where s.status <> 'deleted')::int total_submissions,
+        count(s.id) filter (where s.status <> 'deleted' and s.created_at >= date_trunc('day', now()))::int daily_submissions
+       from tenants t left join forms f on f.tenant_id = t.id left join submissions s on s.form_id = f.id
+       group by t.id order by t.created_at desc`
+    );
+    return result.rows.map((row) => ({ id: row.id, name: row.name, formCount: Number(row.form_count),
+      totalSubmissions: Number(row.total_submissions), dailySubmissions: Number(row.daily_submissions),
+      maxOriginsPerForm: Number(row.max_origins_per_form), maxForms: Number(row.max_forms),
+      maxTotalSubmissions: Number(row.max_total_submissions), maxDailySubmissions: Number(row.max_daily_submissions) }));
+  }
+
+  async getTenantLimits(tenantId: string): Promise<TenantUsage | null> {
+    const result = await this.pool.query(
+      `select t.max_origins_per_form, t.max_forms, t.max_total_submissions, t.max_daily_submissions,
+        (select count(*)::int from forms where tenant_id=t.id) form_count,
+        (select count(*)::int from submissions where tenant_id=t.id and status <> 'deleted') total_submissions,
+        (select count(*)::int from submissions where tenant_id=t.id and status <> 'deleted' and created_at >= date_trunc('day', now())) daily_submissions
+       from tenants t where t.id=$1`, [tenantId]
+    );
+    if (!result.rowCount) return null;
+    const row = result.rows[0];
+    return { maxOriginsPerForm: Number(row.max_origins_per_form), maxForms: Number(row.max_forms),
+      maxTotalSubmissions: Number(row.max_total_submissions), maxDailySubmissions: Number(row.max_daily_submissions),
+      formCount: Number(row.form_count), totalSubmissions: Number(row.total_submissions), dailySubmissions: Number(row.daily_submissions) };
+  }
+
+  async updateTenantLimits(tenantId: string, limits: TenantLimits): Promise<boolean> {
+    const result = await this.pool.query(
+      `update tenants set max_origins_per_form=$2, max_forms=$3, max_total_submissions=$4, max_daily_submissions=$5 where id=$1`,
+      [tenantId, limits.maxOriginsPerForm, limits.maxForms, limits.maxTotalSubmissions, limits.maxDailySubmissions]
+    );
+    return (result.rowCount ?? 0) > 0;
+  }
+
+  async deleteAdminSession(tokenHash: string): Promise<void> {
+    await this.pool.query("delete from admin_sessions where token_hash = $1", [tokenHash]);
+  }
+
+  async getTenantIdForForm(publicKey: string): Promise<string | null> {
+    const result = await this.pool.query("select tenant_id from forms where public_key = $1", [publicKey]);
+    return result.rowCount ? result.rows[0].tenant_id as string : null;
+  }
+
+  async getTenantIdForSubmission(submissionId: string): Promise<string | null> {
+    const result = await this.pool.query("select tenant_id from submissions where id=$1", [submissionId]);
+    return result.rowCount ? result.rows[0].tenant_id as string : null;
+  }
+
+  async updateSubmission(submissionId: string, payload: JsonObject, status: SubmissionStatus): Promise<boolean> {
+    const result = await this.pool.query("update submissions set payload=$2, status=$3 where id=$1", [submissionId, payload, status]);
+    return (result.rowCount ?? 0) > 0;
+  }
+
+  async setFormStatus(publicKey: string, status: "active" | "disabled"): Promise<boolean> {
+    const result = await this.pool.query("update forms set status = $2 where public_key = $1", [publicKey, status]);
+    return (result.rowCount ?? 0) > 0;
+  }
+
   async listSubmissions(publicKey: string, limit: number): Promise<SubmissionRecord[]> {
     const result = await this.pool.query(
       `select s.*
@@ -199,10 +445,13 @@ export class PostgresStore implements Store {
     const result = await this.pool.query(
       `select
          t.name as tenant_name,
+         f.tenant_id,
          f.public_key,
          f.name,
          f.status,
          f.allowed_origins,
+         f.success_message,
+         latest.schema,
          totals.submission_count,
          totals.accepted_count,
          totals.spam_count,
@@ -210,6 +459,7 @@ export class PostgresStore implements Store {
          origins.source_origin_counts
        from forms f
        join tenants t on t.id = f.tenant_id
+       join lateral (select schema from form_versions where form_id=f.id order by version desc limit 1) latest on true
        left join lateral (
          select
            count(*)::int as submission_count,
@@ -231,6 +481,7 @@ export class PostgresStore implements Store {
        order by totals.submission_count desc, totals.last_submitted_at desc nulls last, f.created_at desc`
     );
     return result.rows.map((row) => ({
+      tenantId: row.tenant_id,
       tenantName: row.tenant_name,
       publicKey: row.public_key,
       name: row.name,
@@ -243,7 +494,9 @@ export class PostgresStore implements Store {
         row.last_submitted_at instanceof Date
           ? row.last_submitted_at.toISOString()
           : row.last_submitted_at ?? undefined,
-      sourceOriginCounts: row.source_origin_counts ?? {}
+      sourceOriginCounts: row.source_origin_counts ?? {},
+      successMessage: row.success_message,
+      schema: row.schema
     }));
   }
 

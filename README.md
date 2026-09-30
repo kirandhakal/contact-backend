@@ -4,6 +4,8 @@ Reusable backend for contact forms on frontend-only websites. It supports multi-
 
 ## Quick Start
 
+The Next.js frontend lives in `../react`; see its [setup guide](../react/CONTACT_SETUP.md). This service is API-only. New tenant, pagination, and analytics endpoints are documented in [MANAGEMENT_API.md](./MANAGEMENT_API.md).
+
 ```bash
 cp .env.example .env
 docker compose up -d postgres
