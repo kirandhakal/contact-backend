@@ -443,6 +443,7 @@ describe("contact form API", () => {
     expect(signup.statusCode).toBe(202);
     expect(signup.json()).toEqual({ message: "If this address can be registered, workspace setup will continue." });
     const tenantId = (await store.getAdminByEmail("owner@studio.test"))?.tenantId;
+    expect(store.tenants.get(tenantId!)?.name).toBe("new-studio");
 
     const login = await app.inject({
       method: "POST",

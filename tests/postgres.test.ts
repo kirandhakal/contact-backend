@@ -2,6 +2,9 @@ import { randomUUID } from "node:crypto";
 import { readFile, readdir } from "node:fs/promises";
 import { beforeAll, afterAll, describe, expect, it } from "vitest";
 import pg from "pg";
+import { buildApp } from "../src/app.js";
+import { getConfig } from "../src/config.js";
+import { migrateDatabase } from "../src/db/migrate.js";
 import { PostgresStore } from "../src/db/postgres-store.js";
 import { hashPassword, hashSessionToken } from "../src/admin-auth.js";
 import type { ListQuery } from "../src/management.js";
@@ -26,6 +29,35 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)("PostgreSQL management integrati
   });
   afterAll(async () => {
     await store?.close(); if (pool) { await pool.query(`drop schema ${schema} cascade`); await pool.end(); }
+  });
+  it("reproduces login failure without the lockout migration and repairs signup/login by migrating", async () => {
+    const config = getConfig({ NODE_ENV: "test", DATABASE_URL: pool.options.connectionString!,
+      ADMIN_API_KEY: "test-admin-key-at-least-24-characters", DATA_ENCRYPTION_KEY: "a".repeat(64), PUBLIC_BASE_URL: "http://localhost:3100" });
+    const app = buildApp(config, store);
+    const headers = { origin: config.PUBLIC_BASE_URL };
+    const email = `${randomUUID()}@example.com`;
+    const credentials = { email, password: "signup-test-password", portal: "tenant" };
+    try {
+      await pool.query("DROP TABLE login_lockouts");
+      const signup = await app.inject({ method: "POST", url: "/v1/auth/signup", headers, payload: { workspaceName: "Café & Company", email, password: credentials.password } });
+      expect(signup.statusCode).toBe(202);
+      expect((await app.inject({ method: "POST", url: "/v1/admin/login", headers, payload: credentials })).statusCode).toBe(500);
+      await migrateDatabase(pool.options.connectionString!);
+      const login = await app.inject({ method: "POST", url: "/v1/admin/login", headers, payload: credentials });
+      expect(login.statusCode).toBe(200);
+      const me = await app.inject({ url: "/v1/admin/me", headers: { cookie: login.headers["set-cookie"] as string } });
+      expect(me.json()).toMatchObject({ email, role: "tenant" });
+      const { rows } = await pool.query("SELECT name FROM tenants WHERE id=$1", [me.json().tenantId]);
+      expect(rows[0].name).toBe("cafe-and-company");
+      // Keep this account out of the management aggregate fixtures below.
+      await pool.query("DELETE FROM tenants WHERE id=$1", [me.json().tenantId]);
+    } finally { await app.close(); }
+  });
+  it("handles concurrent successful logins without losing the locking row", async () => {
+    const { checkLogin } = await import("../src/login-lockout.js");
+    const key = randomUUID();
+    const results = await Promise.all(Array.from({ length: 20 }, () => store.withLoginState(key, state => checkLogin(state, async () => true))));
+    expect(results.every(result => result.allowed)).toBe(true);
   });
   it("serializes concurrent login failures and persists across store instances", async () => {
     const { checkLogin } = await import("../src/login-lockout.js");

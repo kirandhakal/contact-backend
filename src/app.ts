@@ -1,3 +1,4 @@
+import { tenantSlug } from "./tenant-name.js";
 import { checkLogin } from "./login-lockout.js";
 import { createRequire } from "node:module";
 import { z } from "zod";
@@ -246,10 +247,10 @@ export function buildApp(config: AppConfig, store: Store) {
       typeof request.body.email !== "string" || typeof request.body.password !== "string") {
       return problem(reply, 400, "Invalid request", "Workspace name, email, and password are required.");
     }
-    const workspaceName = request.body.workspaceName.trim();
+    const workspaceName = tenantSlug(request.body.workspaceName);
     const email = request.body.email.trim().toLowerCase();
     const password = request.body.password;
-    if (!workspaceName || workspaceName.length > 200 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ||
+    if (!workspaceName || workspaceName.length > 200 || request.body.workspaceName.length > 200 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ||
       email.length > 254 || password.length < 8 || password.length > 256) {
       return problem(reply, 422, "Invalid request", "Use a valid workspace, email, and password of at least 8 characters.");
     }
@@ -299,8 +300,8 @@ export function buildApp(config: AppConfig, store: Store) {
     const formKey = request.body.formKey;
     let requestedTenantId = typeof request.body.tenantId === "string" ? request.body.tenantId : null;
     if (role === "tenant" && !requestedTenantId && typeof request.body.tenantName === "string" && actor.role === "sudo") {
-      const tenantName = request.body.tenantName.trim();
-      if (!tenantName || tenantName.length > 200) return problem(reply, 422, "Invalid request", "A valid tenant name is required.");
+      const tenantName = tenantSlug(request.body.tenantName);
+      if (!tenantName || tenantName.length > 200 || request.body.tenantName.length > 200) return problem(reply, 422, "Invalid request", "A valid tenant name is required.");
       requestedTenantId = await store.createTenant(tenantName);
     }
     const tenantId = role === "tenant"
@@ -396,7 +397,7 @@ export function buildApp(config: AppConfig, store: Store) {
     if (!actor) return problem(reply, 401, "Unauthorized", "Sign in required.");
     if (actor.id !== "service-key" && !sameOrigin(request)) return problem(reply, 403, "Forbidden", "Invalid origin.");
     if (actor.role === "tenant") return problem(reply, 403, "Forbidden", "Tenant management requires a super or sudo admin.");
-    const parsed = z.object({ name: z.string().trim().min(1).max(200), email: z.string().trim().email().max(254).transform(v => v.toLowerCase()), password: z.string().min(8).max(256) }).safeParse(request.body);
+    const parsed = z.object({ name: z.string().trim().min(1).max(200).transform(tenantSlug).pipe(z.string().min(1).max(200)), email: z.string().trim().email().max(254).transform(v => v.toLowerCase()), password: z.string().min(8).max(256) }).safeParse(request.body);
     if (!parsed.success) return problem(reply, 422, "Invalid tenant", "Name, valid email, and an 8–256 character password are required.");
     try {
       const account = await store.createSiteAccount(parsed.data.name, parsed.data.email, await hashPassword(parsed.data.password));
@@ -457,6 +458,8 @@ export function buildApp(config: AppConfig, store: Store) {
     const input: CreateFormInput = admin.role === "tenant"
       ? { ...(body as CreateFormInput), tenantId: admin.tenantId ?? undefined }
       : body as CreateFormInput;
+    input.tenantName = tenantSlug(input.tenantName);
+    if (!input.tenantId && (!input.tenantName || input.tenantName.length > 200)) return problem(reply, 422, "Invalid tenant name", "Use a workspace name that produces a non-empty slug of at most 200 characters.");
     for (const origin of input.allowedOrigins) {
       if (!isAllowedOrigin(origin, [origin])) {
         return problem(reply, 422, "Validation failed", "Allowed origins must be exact HTTP or HTTPS origins.");

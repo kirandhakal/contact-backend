@@ -1,4 +1,5 @@
 import pg from "pg";
+import { tenantSlug } from "../tenant-name.js";
 import type { ListQuery, PageResult } from "../management.js";
 import type {
   CreateFormInput,
@@ -70,8 +71,7 @@ export class PostgresStore implements Store {
       const { rows } = await client.query("SELECT * FROM login_lockouts WHERE account_key = $1 FOR UPDATE", [key]);
       const state = { failures: rows[0].failures, level: rows[0].level, lockedUntil: Number(rows[0].locked_until) };
       const result = await action(state);
-      if (state.failures === 0 && state.level === 0) await client.query("DELETE FROM login_lockouts WHERE account_key = $1", [key]);
-      else await client.query("UPDATE login_lockouts SET failures=$2, level=$3, locked_until=$4 WHERE account_key=$1", [key, state.failures, state.level, state.lockedUntil]);
+      await client.query("UPDATE login_lockouts SET failures=$2, level=$3, locked_until=$4 WHERE account_key=$1", [key, state.failures, state.level, state.lockedUntil]);
       await client.query("COMMIT");
       return result;
     } catch (error) {
@@ -99,7 +99,7 @@ export class PostgresStore implements Store {
     const client = await this.pool.connect();
     try {
       await client.query("begin");
-      const tenant = await client.query("insert into tenants(name) values($1) returning id", [tenantName]);
+      const tenant = await client.query("insert into tenants(name) values($1) returning id", [tenantSlug(tenantName)]);
       await client.query(
         "insert into admin_users(email, password_hash, role, tenant_id) values($1, $2, 'tenant', $3)",
         [email, passwordHash, tenant.rows[0].id]
@@ -120,7 +120,7 @@ export class PostgresStore implements Store {
       await client.query("begin");
       const tenant = input.tenantId
         ? await client.query("select id from tenants where id = $1", [input.tenantId])
-        : await client.query("insert into tenants(name) values($1) returning id", [input.tenantName]);
+        : await client.query("insert into tenants(name) values($1) returning id", [tenantSlug(input.tenantName)]);
       if (!tenant.rowCount) throw new Error("Tenant not found");
       const form = await client.query(
         `insert into forms(tenant_id, public_key, name, allowed_origins, success_message, honeypot_field)
@@ -388,7 +388,7 @@ export class PostgresStore implements Store {
   }
 
   async createTenant(name: string): Promise<string> {
-    const result = await this.pool.query("insert into tenants(name) values($1) returning id", [name]);
+    const result = await this.pool.query("insert into tenants(name) values($1) returning id", [tenantSlug(name)]);
     return result.rows[0].id as string;
   }
 
