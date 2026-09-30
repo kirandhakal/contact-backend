@@ -15,7 +15,7 @@ permissions:
 
 env:
   IMAGE: kirandhakal/contact-backend
-  DEPLOY_PATH: /var/www/contact-form
+  DEPLOY_PATH: /var/www/contact-backend
 
 jobs:
   test:
@@ -109,7 +109,6 @@ jobs:
             export IMAGE IMAGE_TAG
             sudo -n docker compose --env-file .env.docker config >/dev/null
             sudo -n docker compose --env-file .env.docker pull app worker
-            sudo -n docker compose --env-file .env.docker up -d postgres
             sudo -n docker compose --env-file .env.docker run --rm app node dist/db/migrate.js
             sudo -n docker compose --env-file .env.docker up -d --force-recreate app worker
 
@@ -124,9 +123,10 @@ jobs:
               sleep 3
             done
             if [ "$HEALTHY" -ne 1 ]; then
-              sudo -n docker compose --env-file .env.docker logs --tail=100 app worker postgres
+              sudo -n docker compose --env-file .env.docker logs --tail=100 app worker
               exit 1
             fi
+            sudo -n docker compose --env-file .env.docker exec -T app node -e "const body='{}'; const request=require('http').request({host:'127.0.0.1',port:3100,path:'/v1/auth/signup',method:'POST',headers:{'content-type':'application/json','content-length':Buffer.byteLength(body),origin:process.env.PUBLIC_BASE_URL}},response=>process.exit(response.statusCode===400?0:1)); request.on('error',()=>process.exit(1)); request.end(body)"
             sudo -n docker image prune -f
             sudo -n docker compose --env-file .env.docker ps
       - name: Notify Discord
