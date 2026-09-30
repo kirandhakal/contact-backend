@@ -17,7 +17,6 @@ import {
   hashIp,
   hashSubmissionAccessToken,
   isAllowedOrigin,
-  isSafeWebhookUrl,
   isValidIdempotencyKey,
   newPublicKey,
   newSubmissionAccessToken
