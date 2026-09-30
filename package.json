@@ -8,6 +8,7 @@
     "start": "node dist/server.js",
     "worker": "tsx src/worker.ts",
     "migrate": "tsx src/db/migrate.ts",
+    "seed:admin": "tsx src/db/seed-admin.ts",
     "docker:up": "docker compose --env-file .env.docker up -d --build",
     "docker:migrate": "docker compose --env-file .env.docker run --rm app node dist/db/migrate.js",
     "docker:logs": "docker compose --env-file .env.docker logs -f app worker",

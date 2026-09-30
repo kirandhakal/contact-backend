@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS submissions (
   source_origin text,
   source_ip_hash text NOT NULL,
   idempotency_key text,
+  access_token_hash text,
   expires_at timestamptz NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now(),
   UNIQUE (form_id, idempotency_key)

@@ -15,7 +15,7 @@ permissions:
 
 env:
   IMAGE: kirandhakal/contact-backend
-  DEPLOY_PATH: /var/www/contact-backend
+  DEPLOY_PATH: /var/www/contact-form
 
 jobs:
   test:
