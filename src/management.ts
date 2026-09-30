@@ -6,6 +6,7 @@ export const listQuery = z.object({
   q: z.string().max(200).default(""),
   status: z.enum(["active", "disabled", "accepted", "spam", "inactive"]).optional(),
   tenantId: z.string().uuid().optional(),
+  formKey: z.string().regex(/^[A-Za-z0-9_-]{1,100}$/).optional(),
   from: z.string().datetime({ offset: true }).optional(),
   to: z.string().datetime({ offset: true }).optional(),
   sort: z.enum(["newest", "oldest", "most-used", "name"]).default("newest"),

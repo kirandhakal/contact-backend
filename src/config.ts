@@ -23,5 +23,9 @@ const EnvSchema = z.object({
 export type AppConfig = z.infer<typeof EnvSchema>;
 
 export function getConfig(env = process.env): AppConfig {
-  return EnvSchema.parse(env);
+  const config = EnvSchema.parse(env);
+  if (config.NODE_ENV === "production" && new URL(config.PUBLIC_BASE_URL).protocol !== "https:") {
+    throw new Error("PUBLIC_BASE_URL must use HTTPS in production");
+  }
+  return config;
 }

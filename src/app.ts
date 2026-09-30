@@ -40,6 +40,25 @@ function assertPlainObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function isBoundedJsonSchema(schema: JsonObject): boolean {
+  let nodes = 0;
+  const visit = (value: unknown, depth: number): boolean => {
+    if (++nodes > 500 || depth > 12) return false;
+    if (Array.isArray(value)) return value.length <= 100 && value.every((item) => visit(item, depth + 1));
+    if (!assertPlainObject(value)) return true;
+    for (const [key, child] of Object.entries(value)) {
+      if (key === "pattern" && (typeof child !== "string" || child.length > 256 || /\([^)]*[+*][^)]*\)[+*{]/.test(child))) return false;
+      if (!visit(child, depth + 1)) return false;
+    }
+    return true;
+  };
+  try {
+    return Buffer.byteLength(JSON.stringify(schema), "utf8") <= 16_384 && visit(schema, 0);
+  } catch {
+    return false;
+  }
+}
+
 function firstHeader(value: string | string[] | undefined): string | undefined {
   return Array.isArray(value) ? value[0] : value;
 }
@@ -119,9 +138,11 @@ export function buildApp(config: AppConfig, store: Store) {
   });
   const limiter = new FixedWindowRateLimiter(config.RATE_LIMIT_WINDOW_SECONDS * 1000, config.RATE_LIMIT_MAX);
   const loginLimiter = new FixedWindowRateLimiter(15 * 60 * 1000, 10);
+  const loginIpLimiter = new FixedWindowRateLimiter(15 * 60 * 1000, 20);
   const signupLimiter = new FixedWindowRateLimiter(60 * 60 * 1000, 5);
   const authTrafficLimiter = new FixedWindowRateLimiter(15 * 60 * 1000, 300);
   const passwordLimiter = new FixedWindowRateLimiter(15 * 60 * 1000, 10);
+  const dummyPasswordHash = hashPassword("not-a-real-account-password");
 
   async function adminFor(request: { headers: Record<string, unknown> }) {
     const auth = request.headers.authorization;
@@ -161,7 +182,13 @@ export function buildApp(config: AppConfig, store: Store) {
   });
 
   app.options("/*", async (request, reply) => {
-    applyCors(reply, request.headers.origin);
+    const origin = typeof request.headers.origin === "string" ? request.headers.origin : undefined;
+    const path = new URL(request.url, config.PUBLIC_BASE_URL).pathname;
+    const pathMatch = /^\/v1\/forms\/([^/]+)(?:\/submissions)?$/.exec(path);
+    if (!origin || !pathMatch) return reply.code(403).send();
+    const form = await store.getActiveForm(pathMatch[1]);
+    if (!form || !isAllowedOrigin(origin, form.allowedOrigins)) return reply.code(403).send();
+    applyCors(reply, origin);
     return reply.code(204).send();
   });
 
@@ -178,22 +205,25 @@ export function buildApp(config: AppConfig, store: Store) {
     if (!sameOrigin(request)) return problem(reply, 403, "Forbidden", "Use the hosted admin page.");
     const limit = authTrafficLimiter.check(request.ip);
     if (!limit.allowed) return problem(reply, 429, "Too many attempts", "Try again later.");
-    if (!assertPlainObject(request.body) || typeof request.body.email !== "string" ||
-      typeof request.body.password !== "string") return problem(reply, 400, "Invalid request", "Email and password are required.");
+    if (!assertPlainObject(request.body) || Object.keys(request.body).some((key) => !["email", "password", "portal"].includes(key)) ||
+      typeof request.body.email !== "string" || typeof request.body.password !== "string" ||
+      ![undefined, "admin", "tenant"].includes(request.body.portal as string | undefined)) return problem(reply, 400, "Invalid request", "Email and password are required.");
     const email = request.body.email.trim().toLowerCase();
-    if (email.length > 254 || request.body.password.length > 256) return problem(reply, 400, "Invalid request", "Invalid credentials.");
-    if (!loginLimiter.check(email).allowed) return problem(reply, 429, "Too many attempts", "Try again later.");
+    if (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !request.body.password || request.body.password.length > 256) return problem(reply, 400, "Invalid request", "Invalid credentials.");
+    const accountAllowed = loginLimiter.check(email).allowed;
+    const ipAllowed = loginIpLimiter.check(request.ip).allowed;
     const admin = await store.getAdminByEmail(email);
-    if (!admin || !(await verifyPassword(request.body.password, admin.passwordHash))) {
+    const passwordMatches = await verifyPassword(request.body.password, admin?.passwordHash ?? await dummyPasswordHash);
+    if (!accountAllowed || !ipAllowed || !admin || !passwordMatches) {
       return problem(reply, 401, "Unauthorized", "Invalid email or password.");
     }
     const portal = request.body.portal === "admin" || request.body.portal === "tenant" ? request.body.portal : null;
     const isStaff = admin.role === "sudo" || admin.role === "super";
     if (portal === "admin" && !isStaff) {
-      return problem(reply, 403, "Forbidden", "Workspace accounts sign in at /login.");
+      return problem(reply, 401, "Unauthorized", "Invalid email or password.");
     }
     if (portal === "tenant" && isStaff) {
-      return problem(reply, 403, "Forbidden", "Service admins sign in at /auth/admin.");
+      return problem(reply, 401, "Unauthorized", "Invalid email or password.");
     }
     const token = newSessionToken();
     await store.createAdminSession(admin.id, hashSessionToken(token), new Date(Date.now() + 8 * 60 * 60 * 1000));
@@ -207,7 +237,7 @@ export function buildApp(config: AppConfig, store: Store) {
     if (!sameOrigin(request)) return problem(reply, 403, "Forbidden", "Use the hosted signup page.");
     const limit = authTrafficLimiter.check(request.ip);
     if (!limit.allowed) return problem(reply, 429, "Too many attempts", "Try again later.");
-    if (!assertPlainObject(request.body) || typeof request.body.workspaceName !== "string" ||
+    if (!assertPlainObject(request.body) || Object.keys(request.body).some((key) => !["workspaceName", "email", "password"].includes(key)) || typeof request.body.workspaceName !== "string" ||
       typeof request.body.email !== "string" || typeof request.body.password !== "string") {
       return problem(reply, 400, "Invalid request", "Workspace name, email, and password are required.");
     }
@@ -218,13 +248,13 @@ export function buildApp(config: AppConfig, store: Store) {
       email.length > 254 || password.length < 8 || password.length > 256) {
       return problem(reply, 422, "Invalid request", "Use a valid workspace, email, and password of at least 8 characters.");
     }
-    if (!signupLimiter.check(email).allowed) return problem(reply, 429, "Too many attempts", "Try again later.");
+    if (!signupLimiter.check(request.ip).allowed) return problem(reply, 429, "Too many attempts", "Try again later.");
     try {
-      const account = await store.createSiteAccount(workspaceName, email, await hashPassword(password));
-      return reply.code(201).send({ email, role: "tenant", tenantId: account.tenantId });
+      await store.createSiteAccount(workspaceName, email, await hashPassword(password));
+      return reply.code(202).send({ message: "If this address can be registered, workspace setup will continue." });
     } catch (error) {
       if (typeof error === "object" && error !== null && "code" in error && error.code === "23505") {
-        return problem(reply, 409, "Account exists", "An account with this email already exists.");
+        return reply.code(202).send({ message: "If this address can be registered, workspace setup will continue." });
       }
       throw error;
     }
@@ -318,6 +348,19 @@ export function buildApp(config: AppConfig, store: Store) {
     if (actor.role === "tenant") parsed.data.tenantId = actor.tenantId!;
     const result = await store.managementPage("forms", parsed.data);
     return { forms: result.items, pagination: result.pagination };
+  });
+
+  app.get("/v1/admin/submissions", async (request, reply) => {
+    const actor = await adminFor(request);
+    if (!actor) return problem(reply, 401, "Unauthorized", "Sign in required.");
+    const parsed = listQuery.safeParse(request.query);
+    if (!parsed.success || (parsed.data.status && !["accepted", "spam"].includes(parsed.data.status))) {
+      return problem(reply, 400, "Invalid filters", "Use valid pagination, dates, status, and form filters.");
+    }
+    if (actor.role === "tenant") parsed.data.tenantId = actor.tenantId!;
+    reply.header("Cache-Control", "no-store");
+    const result = await store.managementPage("submissions", parsed.data);
+    return { submissions: result.items, pagination: result.pagination };
   });
 
   app.get("/v1/admin/analytics", async (request, reply) => {
@@ -421,7 +464,7 @@ export function buildApp(config: AppConfig, store: Store) {
       if (destination.kind === "webhook" && (!destination.secret || destination.secret.length < 24)) return problem(reply, 422, "Validation failed", "Webhooks require a signing secret of at least 24 characters.");
       if (destination.kind === "email" && !z.string().email().safeParse(destination.config.to).success) return problem(reply, 422, "Validation failed", "Email destinations require a valid recipient.");
     }
-    if (!schemaAjv.validateSchema(input.schema)) {
+    if (!isBoundedJsonSchema(input.schema) || !schemaAjv.validateSchema(input.schema)) {
       return problem(reply, 422, "Validation failed", "JSON Schema is invalid.", {
         errors: validationErrors(schemaAjv.errors)
       });
@@ -506,7 +549,7 @@ export function buildApp(config: AppConfig, store: Store) {
       changes.allowedOrigins = origins as string[];
     }
     if (request.body.schema !== undefined) {
-      if (!assertPlainObject(request.body.schema) || !schemaAjv.validateSchema(request.body.schema)) return problem(reply, 422, "Validation failed", "JSON Schema is invalid.");
+      if (!assertPlainObject(request.body.schema) || !isBoundedJsonSchema(request.body.schema) || !schemaAjv.validateSchema(request.body.schema)) return problem(reply, 422, "Validation failed", "JSON Schema is invalid or too complex.");
       changes.schema = request.body.schema;
     }
     if (!Object.keys(changes).length) return problem(reply, 422, "Invalid request", "No supported form changes were supplied.");
@@ -550,7 +593,13 @@ export function buildApp(config: AppConfig, store: Store) {
     const spam = typeof payload[form.honeypotField] === "string" && payload[form.honeypotField] !== "";
     delete payload[form.honeypotField];
 
-    const validatePayload = schemaAjv.compile(form.schema);
+    let validatePayload: ReturnType<typeof schemaAjv.compile>;
+    try {
+      if (!isBoundedJsonSchema(form.schema)) return problem(reply, 422, "Validation failed", "Stored form schema exceeds complexity limits.");
+      validatePayload = schemaAjv.compile(form.schema);
+    } catch {
+      return problem(reply, 422, "Validation failed", "Stored form schema is invalid.");
+    }
     if (!validatePayload(payload)) {
       return problem(reply, 422, "Validation failed", "Submission fields are invalid.", {
         errors: validationErrors(validatePayload.errors)

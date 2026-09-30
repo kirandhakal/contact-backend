@@ -309,13 +309,20 @@ export class PostgresStore implements Store {
     const where: string[] = [];
     let source: string;
     if (resource === "submissions") {
-      where.push(`f.public_key = ${bind(publicKey)}`, "s.status <> 'deleted'");
+      if (publicKey) where.push(`f.public_key = ${bind(publicKey)}`);
+      if (query.formKey) where.push(`f.public_key = ${bind(query.formKey)}`);
+      where.push("s.status <> 'deleted'");
       if (query.tenantId) where.push(`s.tenant_id = ${bind(query.tenantId)}`);
       if (query.status) where.push(`s.status = ${bind(query.status)}`);
-      if (query.q) where.push(`s.payload::text ilike ${bind(`%${query.q}%`)}`);
+      if (query.q) {
+        const search = bind(`%${query.q}%`);
+        where.push(`(s.payload::text ilike ${search} or f.name ilike ${search} or t.name ilike ${search})`);
+      }
       if (query.from) where.push(`s.created_at >= ${bind(query.from)}::timestamptz`);
       if (query.to) where.push(`s.created_at <= ${bind(query.to)}::timestamptz`);
-      source = `select s.id, s.created_at, '' as name, 0 as usage, jsonb_build_object('id',s.id,'payload',s.payload,'status',s.status,'createdAt',s.created_at,'sourceOrigin',s.source_origin) as item from submissions s join forms f on f.id=s.form_id where ${where.join(" and ")}`;
+      source = `select s.id, s.created_at, f.name, 0 as usage,
+        jsonb_build_object('id',s.id,'payload',s.payload,'status',s.status,'createdAt',s.created_at,'sourceOrigin',s.source_origin,'formName',f.name,'formPublicKey',f.public_key,'tenantName',t.name) as item
+        from submissions s join forms f on f.id=s.form_id join tenants t on t.id=s.tenant_id where ${where.join(" and ")}`;
     } else if (resource === "forms") {
       if (query.tenantId) where.push(`f.tenant_id = ${bind(query.tenantId)}`);
       if (query.status) where.push(`f.status = ${bind(query.status)}`);
