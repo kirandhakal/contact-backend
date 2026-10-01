@@ -35,6 +35,8 @@ const config = {
 };
 
 class MemoryStore implements Store {
+  async queueReplies(_key: string, ids: string[], destinations: string[], _message: string, _requestId: string) { return ids.length * destinations.length; }
+  async deliveryStatus() { return []; }
   destinations = new Map<string, import("../src/types.js").DestinationRecord[]>();
   async getFormDestinations(key: string) { return this.destinations.get(key) ?? []; }
   loginStates = new Map<string, import("../src/login-lockout.js").LoginState>();

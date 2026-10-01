@@ -266,11 +266,11 @@ export class PostgresStore implements Store {
         ]
       );
       if (args.status === "accepted") {
-        await client.query(
-          `insert into outbox_jobs(submission_id, destination_id)
-           select $1, id from destinations where form_id = $2 and active = true`,
-          [inserted.rows[0].id, args.form.id]
-        );
+        const destinations = await client.query("SELECT * FROM destinations WHERE form_id=$1 AND active=true", [args.form.id]);
+        for (const row of destinations.rows) {
+          if (mapDestination(row, this.encryptionKey).config.deliveryMode === "manual") continue;
+          await client.query("INSERT INTO outbox_jobs(submission_id,destination_id) VALUES($1,$2)", [inserted.rows[0].id, row.id]);
+        }
       }
       await client.query("commit");
       return { submission: mapSubmission(inserted.rows[0]), duplicate: false };
@@ -620,6 +620,42 @@ export class PostgresStore implements Store {
 
   async markJobDelivered(id: string): Promise<void> {
     await this.pool.query("update outbox_jobs set status = 'delivered', updated_at = now() where id = $1", [id]);
+  }
+
+  async deliveryStatus(publicKey: string, submissionId: string): Promise<JsonObject[]> {
+    const result = await this.pool.query(`SELECT j.id,d.kind,j.status,j.attempts FROM outbox_jobs j
+      JOIN destinations d ON d.id=j.destination_id JOIN submissions s ON s.id=j.submission_id
+      JOIN forms f ON f.id=s.form_id WHERE f.public_key=$1 AND s.id=$2 ORDER BY j.created_at`, [publicKey, submissionId]);
+    return result.rows;
+  }
+
+  async queueReplies(publicKey: string, submissionIds: string[], destinationIds: string[], message: string, requestId: string): Promise<number> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const forms = await client.query("SELECT id FROM forms WHERE public_key=$1 AND status='active' FOR UPDATE", [publicKey]);
+      if (!forms.rowCount) throw new Error("Form not found or disabled.");
+      const formId = forms.rows[0].id;
+      const previous = await client.query("SELECT queued FROM reply_batches WHERE form_id=$1 AND request_id=$2", [formId, requestId]);
+      if (previous.rowCount) { await client.query("COMMIT"); return previous.rows[0].queued; }
+      const submissions = await client.query("SELECT id FROM submissions WHERE form_id=$1 AND id=ANY($2::uuid[]) AND status='accepted' AND expires_at>now() FOR SHARE", [formId, submissionIds]);
+      const destinations = await client.query("SELECT * FROM destinations WHERE form_id=$1 AND id=ANY($2::uuid[]) AND active=true FOR SHARE", [formId, destinationIds]);
+      if (submissions.rowCount !== submissionIds.length || destinations.rowCount !== destinationIds.length) throw new Error("Select accepted, unexpired submissions and current integrations from this form.");
+      for (const row of destinations.rows) {
+        const destination = mapDestination(row, this.encryptionKey);
+        const max = destination.kind === "discord" ? 2000 : destination.kind === "sms" ? 1600 : 8000;
+        if (message.length > max) throw new Error(`Message exceeds the ${max} character limit for ${destination.kind}.`);
+        // Snapshot the message and credentials so later edits cannot change a queued reply.
+        const snapshot = await client.query("INSERT INTO destinations(form_id,kind,config,active) VALUES($1,$2,$3,false) RETURNING id", [formId, destination.kind,
+          encryptDestination({ kind: destination.kind, config: { ...destination.config, template: message }, secret: destination.secret ?? undefined }, this.encryptionKey)]);
+        await client.query("INSERT INTO outbox_jobs(submission_id,destination_id) SELECT unnest($1::uuid[]),$2", [submissionIds, snapshot.rows[0].id]);
+      }
+      const queued = submissions.rows.length * destinations.rows.length;
+      await client.query("INSERT INTO reply_batches(form_id,request_id,queued) VALUES($1,$2,$3)", [formId, requestId, queued]);
+      await client.query("COMMIT");
+      return queued;
+    } catch (error) { await client.query("ROLLBACK"); throw error; }
+    finally { client.release(); }
   }
 
   async markJobFailed(id: string, attempts: number, error: string): Promise<void> {

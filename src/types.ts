@@ -122,6 +122,8 @@ export interface OutboxJob {
 }
 
 export interface Store {
+  queueReplies(publicKey: string, submissionIds: string[], destinationIds: string[], message: string, requestId: string): Promise<number>;
+  deliveryStatus(publicKey: string, submissionId: string): Promise<JsonObject[]>;
   getFormDestinations(publicKey: string): Promise<DestinationRecord[]>;
   withLoginState<T>(key: string, action: (state: import("./login-lockout.js").LoginState) => Promise<T>): Promise<T>;
   managementPage(resource: "forms" | "tenants" | "submissions", query: import("./management.js").ListQuery, publicKey?: string): Promise<import("./management.js").PageResult>;
