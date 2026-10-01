@@ -92,6 +92,32 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)("PostgreSQL management integrati
       expect(result.retryAfterSeconds).toBeGreaterThan(0);
     } finally { await second.close(); }
   });
+  it("queues automatic rules only, supports manual bulk replies, rejects foreign submissions, and deduplicates retries", async () => {
+    const tenant = await store.createTenant("Reply tests");
+    const publicKey = `frm_${randomUUID()}`;
+    try {
+      const form = await store.createForm({ tenantName: "Reply tests", tenantId: tenant, name: "Replies", allowedOrigins: ["https://example.com"], schema: { type: "object" }, destinations: [
+        { kind: "email", config: { recipientField: "email", deliveryMode: "manual", template: "Manual" } },
+        { kind: "discord", config: { deliveryMode: "automatic", template: "New submission" }, secret: "https://discord.com/api/webhooks/123/test-token" }
+      ] }, publicKey);
+      const result = await store.createSubmission({ form, payload: { name: "Alex Morgan", email: "alex@example.com" }, status: "accepted", sourceIpHash: "test", accessTokenHash: "test", expiresAt: new Date(Date.now() + 60000) });
+      const initial = await store.deliveryStatus(publicKey, result.submission.id);
+      expect(initial).toHaveLength(1); expect(initial[0].kind).toBe("discord");
+      const destinations = await store.getFormDestinations(publicKey);
+      const ids = destinations.map(d => d.id);
+      await expect(store.queueReplies(publicKey, [randomUUID()], ids, "Hello", randomUUID())).rejects.toThrow(/accepted/);
+      await expect(store.queueReplies(publicKey, [result.submission.id], [randomUUID()], "Hello", randomUUID())).rejects.toThrow(/integrations/);
+      const requestId = randomUUID();
+      expect(await Promise.all([1, 2].map(() => store.queueReplies(publicKey, [result.submission.id], ids, "Hello {{name}}", requestId)))).toEqual([2, 2]);
+      expect(await store.deliveryStatus(publicKey, result.submission.id)).toHaveLength(3);
+      expect(await store.getFormDestinations(publicKey)).toHaveLength(2);
+      const jobs = await store.claimJobs(20);
+      expect(jobs.filter(j => j.destination.config.template === "Hello {{name}}")).toHaveLength(2);
+      expect(jobs.every(j => j.submission.id === result.submission.id)).toBe(true);
+      for (const job of jobs) await store.markJobDelivered(job.id);
+      expect((await store.deliveryStatus(publicKey, result.submission.id)).every(d => d.status === "delivered")).toBe(true);
+    } finally { await pool.query("DELETE FROM tenants WHERE id=$1", [tenant]); }
+  });
   it("paginates SQL aggregates and preserves totals on out-of-range pages", async () => {
     const page = await store.managementPage("forms", { ...query, tenantId });
     expect(page.pagination.total).toBe(2); expect(page.items[0]).toMatchObject({ publicKey: key, submissionCount: 2, acceptedCount: 1, spamCount: 1 });

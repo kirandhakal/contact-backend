@@ -461,6 +461,39 @@ describe("contact form API", () => {
     expect(signup.statusCode).toBe(202);
     const login = await app.inject({ method: "POST", url: "/v1/admin/login", headers: { origin: config.PUBLIC_BASE_URL }, payload: { email: "integrations@example.com", password: "integration-password" } });
     expect((await app.inject({ url: `${path}/destinations`, headers: { cookie: login.headers["set-cookie"] as string } })).statusCode).toBe(404);
+    for (const endpoint of ["test", "replies"]) {
+      expect((await app.inject({ method: "POST", url: `${path}/${endpoint}`, headers: { cookie: login.headers["set-cookie"] as string, origin: config.PUBLIC_BASE_URL }, payload: {} })).statusCode).toBe(404);
+    }
+    await app.close();
+  });
+  it("validates dummy submissions without saving, then saves one idempotent test submission", async () => {
+    const store = new MemoryStore(); const { app, body } = await createTestForm(store);
+    const url = `/v1/admin/forms/${body.publicKey}/test`;
+    const headers = { authorization: `Bearer ${config.ADMIN_API_KEY}` };
+    const payload = { payload: { name: "Alex Morgan", email: "alex@example.com", topic: "sales", message: "Let’s build something together.", _website: "" }, requestId: randomUUID() };
+    expect((await app.inject({ method: "POST", url, payload })).statusCode).toBe(401);
+    expect((await app.inject({ method: "POST", url, headers, payload })).statusCode).toBe(200);
+    expect(store.submissions).toHaveLength(0);
+    expect((await app.inject({ method: "POST", url, headers, payload: { ...payload, payload: { ...payload.payload, email: "invalid" } } })).statusCode).toBe(422);
+    for (let i = 0; i < 2; i++) expect((await app.inject({ method: "POST", url, headers, payload: { ...payload, send: true } })).statusCode).toBe(202);
+    expect(store.submissions).toHaveLength(1);
+    expect(store.submissions[0].payload).not.toHaveProperty("_website");
+    expect(store.submissions[0].sourceOrigin).toBe("admin-test");
+    await app.close();
+  });
+
+  it("rejects missing integrations and unknown template fields in bulk replies", async () => {
+    const store = new MemoryStore(); const { app, body } = await createTestForm(store);
+    const headers = { authorization: `Bearer ${config.ADMIN_API_KEY}` };
+    const form = store.forms.get(body.publicKey)!;
+    const destination = { id: randomUUID(), formId: form.id, kind: "email" as const, config: { recipientField: "email", deliveryMode: "manual" }, active: true };
+    store.destinations.set(body.publicKey, [destination]);
+    const url = `/v1/admin/forms/${body.publicKey}/replies`;
+    const payload = { submissionIds: [randomUUID()], destinationIds: [destination.id], message: "Hello {{name}}", requestId: randomUUID() };
+    expect((await app.inject({ method: "POST", url, payload })).statusCode).toBe(401);
+    expect((await app.inject({ method: "POST", url, headers, payload: { ...payload, destinationIds: [randomUUID()] } })).statusCode).toBe(422);
+    expect((await app.inject({ method: "POST", url, headers, payload: { ...payload, message: "Hello {{unknown}}" } })).statusCode).toBe(422);
+    expect((await app.inject({ method: "POST", url, headers, payload })).json().queued).toBe(1);
     await app.close();
   });
   it("signs up a customer workspace and lets its owner create forms", async () => {

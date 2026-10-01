@@ -604,7 +604,7 @@ export class PostgresStore implements Store {
       const jobs = result.rows.map((row) => ({
         id: row.id,
         attempts: Number(row.attempts),
-        submission: mapSubmission(row),
+        submission: mapSubmission({ ...row, id: row.submission_id }),
         form: { id: row.form_id, name: row.form_name },
         destination: mapDestination(row, this.encryptionKey)
       }));
