@@ -35,6 +35,7 @@ const config = {
 };
 
 class MemoryStore implements Store {
+  async findReplySubmissions(key: string) { return this.submissions.filter(s => s.formId === this.forms.get(key)?.id && s.status === "accepted").map(s => s.id); }
   async queueReplies(_key: string, ids: string[], destinations: string[], _message: string, _requestId: string) { return ids.length * destinations.length; }
   async deliveryStatus() { return []; }
   destinations = new Map<string, import("../src/types.js").DestinationRecord[]>();

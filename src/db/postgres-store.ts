@@ -2,6 +2,8 @@ import pg from "pg";
 import { encryptDestination, decryptDestination } from "../integrations.js";
 import { tenantSlug } from "../tenant-name.js";
 import type { ListQuery, PageResult } from "../management.js";
+import { payloadConditions, type ReplyFilters } from "../management.js";
+import { z } from "zod";
 import type {
   CreateFormInput,
   AdminRole,
@@ -225,6 +227,7 @@ export class PostgresStore implements Store {
   }
 
   async createSubmission(args: {
+    skipAutomatic?: boolean;
     form: FormRecord;
     payload: JsonObject;
     status: SubmissionStatus;
@@ -266,7 +269,7 @@ export class PostgresStore implements Store {
           args.expiresAt
         ]
       );
-      if (args.status === "accepted") {
+      if (args.status === "accepted" && !args.skipAutomatic) {
         const destinations = await client.query("SELECT * FROM destinations WHERE form_id=$1 AND active=true", [args.form.id]);
         for (const row of destinations.rows) {
           if (mapDestination(row, this.encryptionKey).config.deliveryMode === "manual") continue;
@@ -352,6 +355,7 @@ export class PostgresStore implements Store {
       }
       if (query.from) where.push(`s.created_at >= ${bind(query.from)}::timestamptz`);
       if (query.to) where.push(`s.created_at <= ${bind(query.to)}::timestamptz`);
+      where.push(...payloadConditions(query.fields, bind));
       source = `select s.id, s.created_at, f.name, 0 as usage,
         jsonb_build_object('id',s.id,'payload',s.payload,'status',s.status,'createdAt',s.created_at,'sourceOrigin',s.source_origin,'formName',f.name,'formPublicKey',f.public_key,'tenantName',t.name) as item
         from submissions s join forms f on f.id=s.form_id join tenants t on t.id=s.tenant_id where ${where.join(" and ")}`;
@@ -630,7 +634,18 @@ export class PostgresStore implements Store {
     return result.rows;
   }
 
-  async queueReplies(publicKey: string, submissionIds: string[], destinationIds: string[], message: string, requestId: string): Promise<number> {
+  async findReplySubmissions(publicKey: string, filters: ReplyFilters): Promise<string[]> {
+    const values: unknown[] = [publicKey];
+    const bind = (value: unknown) => { values.push(value); return `$${values.length}`; };
+    const where = ["f.public_key=$1", "s.status='accepted'", "s.expires_at>now()", ...payloadConditions(filters.fields, bind)];
+    if (filters.q) { const q = bind(`%${filters.q}%`); where.push(`(s.payload::text ILIKE ${q} OR f.name ILIKE ${q} OR t.name ILIKE ${q})`); }
+    if (filters.from) where.push(`s.created_at>=${bind(filters.from)}::timestamptz`);
+    if (filters.to) where.push(`s.created_at<=${bind(filters.to)}::timestamptz`);
+    const result = await this.pool.query(`SELECT s.id FROM submissions s JOIN forms f ON f.id=s.form_id JOIN tenants t ON t.id=s.tenant_id WHERE ${where.join(" AND ")} ORDER BY s.id LIMIT 10001`, values);
+    return result.rows.map(row => row.id);
+  }
+
+  async queueReplies(publicKey: string, submissionIds: string[], destinationIds: string[], message: string, requestId: string, subject?: string): Promise<number> {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
@@ -639,19 +654,26 @@ export class PostgresStore implements Store {
       const formId = forms.rows[0].id;
       const previous = await client.query("SELECT queued FROM reply_batches WHERE form_id=$1 AND request_id=$2", [formId, requestId]);
       if (previous.rowCount) { await client.query("COMMIT"); return previous.rows[0].queued; }
-      const submissions = await client.query("SELECT id FROM submissions WHERE form_id=$1 AND id=ANY($2::uuid[]) AND status='accepted' AND expires_at>now() FOR SHARE", [formId, submissionIds]);
+      const submissions = await client.query("SELECT id,payload FROM submissions WHERE form_id=$1 AND id=ANY($2::uuid[]) AND status='accepted' AND expires_at>now() FOR SHARE", [formId, submissionIds]);
       const destinations = await client.query("SELECT * FROM destinations WHERE form_id=$1 AND id=ANY($2::uuid[]) AND active=true FOR SHARE", [formId, destinationIds]);
       if (submissions.rowCount !== submissionIds.length || destinations.rowCount !== destinationIds.length) throw new Error("Select accepted, unexpired submissions and current integrations from this form.");
+      let queued = 0;
       for (const row of destinations.rows) {
         const destination = mapDestination(row, this.encryptionKey);
+        const eligibleIds = submissions.rows.filter(row => {
+          if (!["email", "sms"].includes(destination.kind)) return true;
+          const recipient = destination.config.recipientField ? row.payload[String(destination.config.recipientField)] : destination.config.to;
+          return (destination.kind === "email" ? z.string().email() : z.string().regex(/^\+[1-9]\d{7,14}$/)).safeParse(recipient).success;
+        }).map(row => row.id);
+        if (!eligibleIds.length) continue;
         const max = destination.kind === "discord" ? 2000 : destination.kind === "sms" ? 1600 : 8000;
         if (message.length > max) throw new Error(`Message exceeds the ${max} character limit for ${destination.kind}.`);
         // Snapshot the message and credentials so later edits cannot change a queued reply.
         const snapshot = await client.query("INSERT INTO destinations(form_id,kind,config,active) VALUES($1,$2,$3,false) RETURNING id", [formId, destination.kind,
-          encryptDestination({ kind: destination.kind, config: { ...destination.config, template: message, eventType: "form.reply.created" }, secret: destination.secret ?? undefined }, this.encryptionKey)]);
-        await client.query("INSERT INTO outbox_jobs(submission_id,destination_id) SELECT unnest($1::uuid[]),$2", [submissionIds, snapshot.rows[0].id]);
+          encryptDestination({ kind: destination.kind, config: { ...destination.config, ...(message ? { template: message, eventType: "form.reply.created" } : {}), ...(subject && destination.kind === "email" ? { subject } : {}) }, secret: destination.secret ?? undefined }, this.encryptionKey)]);
+        await client.query("INSERT INTO outbox_jobs(submission_id,destination_id) SELECT unnest($1::uuid[]),$2", [eligibleIds, snapshot.rows[0].id]);
+        queued += eligibleIds.length;
       }
-      const queued = submissions.rows.length * destinations.rows.length;
       await client.query("INSERT INTO reply_batches(form_id,request_id,queued) VALUES($1,$2,$3)", [formId, requestId, queued]);
       await client.query("COMMIT");
       return queued;
