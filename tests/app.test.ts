@@ -462,7 +462,7 @@ describe("contact form API", () => {
     expect(signup.statusCode).toBe(202);
     const login = await app.inject({ method: "POST", url: "/v1/admin/login", headers: { origin: config.PUBLIC_BASE_URL }, payload: { email: "integrations@example.com", password: "integration-password" } });
     expect((await app.inject({ url: `${path}/destinations`, headers: { cookie: login.headers["set-cookie"] as string } })).statusCode).toBe(404);
-    for (const endpoint of ["test", "replies"]) {
+    for (const endpoint of ["test", "replies", "replies/preview"]) {
       expect((await app.inject({ method: "POST", url: `${path}/${endpoint}`, headers: { cookie: login.headers["set-cookie"] as string, origin: config.PUBLIC_BASE_URL }, payload: {} })).statusCode).toBe(404);
     }
     await app.close();

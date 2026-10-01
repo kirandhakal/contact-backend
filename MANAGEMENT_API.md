@@ -54,3 +54,17 @@ Top forms are limited to ten. Daily buckets are UTC and omit days without submis
 `PATCH /v1/admin/tenants/:tenantId` continues to accept all four positive-integer limits: `maxForms`, `maxOriginsPerForm`, `maxTotalSubmissions`, `maxDailySubmissions`.
 
 The existing `/v1/admin/forms/summary` remains for compatibility. New clients should use the paginated form list. Submission list responses retain the `submissions` key and add pagination; the default page size is now 20 and maximum 100.
+
+## Automation, test submissions, and bulk replies
+
+Run `npm run migrate` before using bulk replies (migration 008).
+
+Each destination's `config.deliveryMode` is `automatic` or `manual`. Existing rules without a mode remain automatic; the editor defaults new rules to manual. Forms with no automatic rules only store incoming submissions. Paginated form records include `automaticRules` and `manualRules` counts.
+
+Authenticated endpoints (tenant scoped; cookie mutations require same origin):
+
+- `POST /v1/admin/forms/:publicKey/test`: `{ payload: { name: "Alex Morgan", email: "alex@example.com", message: "Let’s build something together.", _website: "" }, send: false, requestId: "<uuid>" }`. Validates against the saved schema without persistence or delivery. With `send: true`, creates an accepted submission and queues automatic rules; returns its `submissionId`. Reuse the request ID when retrying. Tests bypass public origin/bot checks, but enforce schema, workspace limits and admin rate limits. Use an address you control for real delivery.
+- `GET /v1/admin/forms/:publicKey/delivery/:submissionId`: returns channel, status and attempt count for queued jobs. Provider acceptance does not guarantee inbox delivery.
+- `POST /v1/admin/forms/:publicKey/replies`: `{ submissionIds: ["<uuid>"], destinationIds: ["<uuid>"], message: "Hello {{name}}", requestId: "<uuid>" }`. Atomically queues up to 100 accepted, unexpired submissions across up to 20 active integrations from the same active form, including manual rules. Reusing the request ID returns the original queued count. Credentials and message content are snapshotted. Fixed destinations receive one message per selected submission; field destinations resolve each submitter's address.
+
+The worker must be running with provider credentials configured. Webhook events include a `deliveryId` for receiver deduplication; manual replies use type `form.reply.created`. The legacy `id` remains the submission ID. Deduplicating only on the submission ID would suppress later replies.
