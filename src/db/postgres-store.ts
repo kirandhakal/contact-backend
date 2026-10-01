@@ -238,6 +238,7 @@ export class PostgresStore implements Store {
     try {
       await client.query("begin");
       if (args.idempotencyKey) {
+        await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`${args.form.id}:${args.idempotencyKey}`]);
         const existing = await client.query(
           "select * from submissions where form_id = $1 and idempotency_key = $2",
           [args.form.id, args.idempotencyKey]
@@ -362,7 +363,7 @@ export class PostgresStore implements Store {
       if (query.from) dates.push(`s.created_at >= ${bind(query.from)}::timestamptz`);
       if (query.to) dates.push(`s.created_at <= ${bind(query.to)}::timestamptz`);
       source = `select f.id, f.created_at, f.name, stats.total as usage,
-        jsonb_build_object('publicKey',f.public_key,'tenantId',f.tenant_id,'tenantName',t.name,'name',f.name,'status',f.status,'allowedOrigins',f.allowed_origins,'submissionCount',stats.total,'acceptedCount',stats.accepted,'spamCount',stats.spam,'lastSubmittedAt',stats.last_at,'schema',v.schema,'successMessage',f.success_message) as item
+        jsonb_build_object('publicKey',f.public_key,'tenantId',f.tenant_id,'tenantName',t.name,'name',f.name,'status',f.status,'allowedOrigins',f.allowed_origins,'submissionCount',stats.total,'acceptedCount',stats.accepted,'spamCount',stats.spam,'lastSubmittedAt',stats.last_at,'schema',v.schema,'successMessage',f.success_message,'honeypotField',f.honeypot_field) as item
         from forms f join tenants t on t.id=f.tenant_id
         join lateral (select schema from form_versions where form_id=f.id order by version desc limit 1) v on true
         cross join lateral (select count(*)::int total, count(*) filter(where s.status='accepted')::int accepted, count(*) filter(where s.status='spam')::int spam, max(s.created_at) last_at from submissions s where ${dates.join(" and ")}) stats
@@ -647,7 +648,7 @@ export class PostgresStore implements Store {
         if (message.length > max) throw new Error(`Message exceeds the ${max} character limit for ${destination.kind}.`);
         // Snapshot the message and credentials so later edits cannot change a queued reply.
         const snapshot = await client.query("INSERT INTO destinations(form_id,kind,config,active) VALUES($1,$2,$3,false) RETURNING id", [formId, destination.kind,
-          encryptDestination({ kind: destination.kind, config: { ...destination.config, template: message }, secret: destination.secret ?? undefined }, this.encryptionKey)]);
+          encryptDestination({ kind: destination.kind, config: { ...destination.config, template: message, eventType: "form.reply.created" }, secret: destination.secret ?? undefined }, this.encryptionKey)]);
         await client.query("INSERT INTO outbox_jobs(submission_id,destination_id) SELECT unnest($1::uuid[]),$2", [submissionIds, snapshot.rows[0].id]);
       }
       const queued = submissions.rows.length * destinations.rows.length;

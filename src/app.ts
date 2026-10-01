@@ -353,7 +353,11 @@ export function buildApp(config: AppConfig, store: Store) {
     if (!parsed.success || (parsed.data.status && !["active", "disabled"].includes(parsed.data.status))) return problem(reply, 400, "Invalid filters", "Use valid pagination and active/disabled status.");
     if (actor.role === "tenant") parsed.data.tenantId = actor.tenantId!;
     const result = await store.managementPage("forms", parsed.data);
-    return { forms: result.items, pagination: result.pagination };
+    const forms = await Promise.all(result.items.map(async item => {
+      const destinations = await store.getFormDestinations(String(item.publicKey));
+      return { ...item, automaticRules: destinations.filter(d => d.config.deliveryMode !== "manual").length, manualRules: destinations.filter(d => d.config.deliveryMode === "manual").length };
+    }));
+    return { forms, pagination: result.pagination };
   });
 
   app.get("/v1/admin/submissions", async (request, reply) => {

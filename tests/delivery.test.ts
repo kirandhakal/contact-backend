@@ -50,4 +50,8 @@ describe("delivery adapters", () => {
     await expect(deliverJob(job("email", { recipientField: "name" }), config)).rejects.toThrow();
     expect(mocks.sendMail).not.toHaveBeenCalled();
   });
+  it("identifies bulk reply events separately and supplies a stable delivery ID for retries", async () => {
+    await deliverJob(job("webhook", { url: "https://example.com/events", template: "Reply to {{name}}", eventType: "form.reply.created" }, "secret"), config);
+    expect(JSON.parse(mocks.body)).toMatchObject({ id: "sub", deliveryId: "job", type: "form.reply.created", message: "Reply to Alex" });
+  });
 });
