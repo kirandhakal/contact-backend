@@ -36,6 +36,13 @@ const config = {
 };
 
 class MemoryStore implements Store {
+  siteContacts = new Map<string, import("../src/types.js").SiteContactMessage>();
+  async saveSiteContact(input: { name: string; email: string; message: string }, key: string) {
+    if (!this.siteContacts.has(key)) this.siteContacts.set(key, { id: randomUUID(), name: input.name, email: input.email, message: input.message, createdAt: new Date().toISOString() });
+  }
+  async listSiteContacts(page: number, limit: number) { return { messages: [...this.siteContacts.values()].slice((page - 1) * limit, page * limit), total: this.siteContacts.size }; }
+  async deleteSiteContact(id: string) { for (const [key, item] of this.siteContacts) if (item.id === id) return this.siteContacts.delete(key); return false; }
+
   async findReplySubmissions(key: string) { return this.submissions.filter(s => s.formId === this.forms.get(key)?.id && s.status === "accepted").map(s => s.id); }
   async queueReplies(_key: string, ids: string[], destinations: string[], _message: string, _requestId: string) { return ids.length * destinations.length; }
   async deliveryStatus() { return []; }
@@ -827,5 +834,60 @@ describe("contact form API", () => {
 
     expect(response.statusCode).toBe(403);
     expect(response.json().detail).toBe("Bot verification failed.");
+  });
+});
+
+
+describe("website contact inbox", () => {
+  it("accepts messages without a tenant form, deduplicates retries, and rejects invalid/spam input", async () => {
+    const store = new MemoryStore(); const app = buildApp(config, store);
+    try {
+      const headers = { origin: config.PUBLIC_BASE_URL, "idempotency-key": randomUUID() };
+      const payload = { name: "Alex", email: "alex@example.com", message: "Please help me get started.", _website: "" };
+      for (let i = 0; i < 2; i++) expect((await app.inject({ method: "POST", url: "/v1/site-contact", headers, payload })).statusCode).toBe(202);
+      expect(store.siteContacts.size).toBe(1); expect(store.forms.size).toBe(0); expect(store.submissions).toEqual([]);
+      expect((await app.inject({ method: "POST", url: "/v1/site-contact", headers, payload: { ...payload, email: "invalid" } })).statusCode).toBe(422);
+      expect((await app.inject({ method: "POST", url: "/v1/site-contact", headers: { ...headers, origin: "https://evil.example" }, payload })).statusCode).toBe(403);
+      expect((await app.inject({ method: "POST", url: "/v1/site-contact", headers: { origin: config.PUBLIC_BASE_URL }, payload })).statusCode).toBe(422);
+      expect((await app.inject({ method: "POST", url: "/v1/site-contact", headers: { ...headers, "idempotency-key": randomUUID() }, payload: { ...payload, _website: "spam" } })).statusCode).toBe(202);
+      expect(store.siteContacts.size).toBe(1);
+    } finally { await app.close(); }
+  });
+  it("permits only super/sudo admins to read and delete messages, with pagination and origin checks", async () => {
+    const store = new MemoryStore(); const app = buildApp(config, store);
+    const { hashSessionToken } = await import("../src/admin-auth.js");
+    try {
+      await store.saveSiteContact({ name: "Private", email: "private@example.com", message: "An admin-only message" }, randomUUID());
+      const id = [...store.siteContacts.values()][0].id;
+      expect((await app.inject({ url: "/v1/admin/site-contact" })).statusCode).toBe(401);
+      expect((await app.inject({ method: "DELETE", url: `/v1/admin/site-contact/${id}` })).statusCode).toBe(401);
+      for (const role of ["tenant", "super", "sudo"] as const) {
+        const token = (role === "tenant" ? "t" : role === "super" ? "s" : "u").repeat(43);
+        await store.createAdmin(role + "@example.com", "unused", role, role === "tenant" ? randomUUID() : null);
+        await store.createAdminSession(store.admins.get(role + "@example.com")!.id, hashSessionToken(token));
+        const headers = { cookie: `contact_admin=${token}`, origin: config.PUBLIC_BASE_URL };
+        const response = await app.inject({ url: "/v1/admin/site-contact?limit=1", headers });
+        expect(response.statusCode).toBe(role === "tenant" ? 403 : 200);
+        if (role === "tenant") expect((await app.inject({ method: "DELETE", url: `/v1/admin/site-contact/${id}`, headers })).statusCode).toBe(403);
+        else {
+          expect(response.json().messages[0].message).toBe("An admin-only message");
+          expect(response.headers["cache-control"]).toBe("no-store");
+          expect((await app.inject({ url: "/v1/admin/site-contact?page=2&limit=1", headers })).json().messages).toEqual([]);
+          expect((await app.inject({ url: "/v1/admin/site-contact?page=0", headers })).statusCode).toBe(422);
+          expect((await app.inject({ method: "DELETE", url: `/v1/admin/site-contact/${id}`, headers: { ...headers, origin: "https://evil.example" } })).statusCode).toBe(403);
+        }
+      }
+      const headers = { authorization: `Bearer ${config.ADMIN_API_KEY}`, origin: config.PUBLIC_BASE_URL };
+      expect((await app.inject({ method: "DELETE", url: `/v1/admin/site-contact/${id}`, headers })).statusCode).toBe(200);
+      expect(store.siteContacts.size).toBe(0);
+    } finally { await app.close(); }
+  });
+  it("rate limits website messages", async () => {
+    const app = buildApp({ ...config, RATE_LIMIT_MAX: 1 }, new MemoryStore());
+    try {
+      const request = { method: "POST" as const, url: "/v1/site-contact", headers: { origin: config.PUBLIC_BASE_URL, "idempotency-key": randomUUID() }, payload: { name: "Alex", email: "alex@example.com", message: "Please help me get started." } };
+      expect((await app.inject(request)).statusCode).toBe(202);
+      const limited = await app.inject(request); expect(limited.statusCode).toBe(429); expect(limited.headers["retry-after"]).toBeDefined();
+    } finally { await app.close(); }
   });
 });

@@ -121,7 +121,18 @@ export interface OutboxJob {
   attempts: number;
 }
 
+export interface SiteContactMessage {
+  id: string;
+  name: string;
+  email: string;
+  message: string;
+  createdAt: string;
+}
+
 export interface Store {
+  saveSiteContact(input: { name: string; email: string; message: string }, key: string): Promise<void>;
+  listSiteContacts(page: number, limit: number): Promise<{ messages: SiteContactMessage[]; total: number }>;
+  deleteSiteContact(id: string): Promise<boolean>;
   findReplySubmissions(publicKey: string, filters: import("./management.js").ReplyFilters): Promise<string[]>;
   queueReplies(publicKey: string, submissionIds: string[], destinationIds: string[], message: string, requestId: string, subject?: string): Promise<number>;
   deliveryStatus(publicKey: string, submissionId: string): Promise<JsonObject[]>;

@@ -192,6 +192,43 @@ export function buildApp(config: AppConfig, store: Store) {
     return reply.code(204).send();
   });
 
+  // Website enquiries are independent of tenant forms and their delivery queues.
+  app.post("/v1/site-contact", async (request, reply) => {
+    if (!sameOrigin(request)) return problem(reply, 403, "Forbidden", "Use the website contact page.");
+    const rate = limiter.check(`site-contact:${request.ip}`);
+    if (!rate.allowed) { reply.header("Retry-After", rate.retryAfterSeconds); return problem(reply, 429, "Rate limit exceeded", "Please wait before sending another message."); }
+    const parsed = z.object({
+      name: z.string().trim().min(1).max(100), email: z.string().trim().email().max(254),
+      message: z.string().trim().min(10).max(5000), _website: z.string().max(500).optional()
+    }).strict().safeParse(request.body);
+    if (!parsed.success) return problem(reply, 422, "Invalid message", "Check your name, email, and message.");
+    const key = firstHeader(request.headers["idempotency-key"]);
+    if (!key || !isValidIdempotencyKey(key)) return problem(reply, 422, "Invalid request", "A valid idempotency key is required.");
+    if (!parsed.data._website) await store.saveSiteContact(parsed.data, key);
+    return reply.code(202).send({ message: "Your message was received." });
+  });
+
+  app.get("/v1/admin/site-contact", async (request, reply) => {
+    const actor = await adminFor(request);
+    if (!actor) return problem(reply, 401, "Unauthorized", "Sign in to continue.");
+    if (actor.role === "tenant") return problem(reply, 403, "Forbidden", "Only service administrators can read website messages.");
+    const query = z.object({ page: z.coerce.number().int().min(1).max(100000).default(1), limit: z.coerce.number().int().min(1).max(100).default(20) }).safeParse(request.query);
+    if (!query.success) return problem(reply, 422, "Invalid request", "Invalid page or limit.");
+    const { page, limit } = query.data;
+    const result = await store.listSiteContacts(page, limit);
+    return { messages: result.messages, pagination: { page, limit, total: result.total, pages: Math.ceil(result.total / limit) } };
+  });
+
+  app.delete<{ Params: { id: string } }>("/v1/admin/site-contact/:id", async (request, reply) => {
+    const actor = await adminFor(request);
+    if (!actor) return problem(reply, 401, "Unauthorized", "Sign in to continue.");
+    if (actor.role === "tenant") return problem(reply, 403, "Forbidden", "Only service administrators can delete website messages.");
+    if (!sameOrigin(request)) return problem(reply, 403, "Forbidden", "Invalid request origin.");
+    if (!z.string().uuid().safeParse(request.params.id).success) return problem(reply, 422, "Invalid request", "Invalid message ID.");
+    if (!await store.deleteSiteContact(request.params.id)) return problem(reply, 404, "Not found", "Message not found.");
+    return { deleted: true };
+  });
+
   app.get("/health/live", async () => ({ status: "ok" }));
 
   app.get("/", async () => ({

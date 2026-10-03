@@ -30,6 +30,16 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)("PostgreSQL management integrati
   afterAll(async () => {
     await store?.close(); if (pool) { await pool.query(`drop schema ${schema} cascade`); await pool.end(); }
   });
+  it("stores website messages separately and deduplicates concurrent retries", async () => {
+    const input = { name: "Website visitor", email: "visitor@example.com", message: "Help with the service please." };
+    const requestId = randomUUID();
+    await Promise.all(Array.from({ length: 5 }, () => store.saveSiteContact(input, requestId)));
+    const result = await store.listSiteContacts(1, 20);
+    expect(result.total).toBe(1); expect(result.messages[0]).toMatchObject(input);
+    expect((await store.listSiteContacts(2, 20)).messages).toEqual([]);
+    expect(await store.deleteSiteContact(result.messages[0].id)).toBe(true);
+    expect((await store.listSiteContacts(1, 20)).total).toBe(0);
+  });
   it("reproduces login failure without the lockout migration and repairs signup/login by migrating", async () => {
     const config = getConfig({ NODE_ENV: "test", DATABASE_URL: pool.options.connectionString!,
       ADMIN_API_KEY: "test-admin-key-at-least-24-characters", DATA_ENCRYPTION_KEY: "a".repeat(64), PUBLIC_BASE_URL: "http://localhost:3100" });

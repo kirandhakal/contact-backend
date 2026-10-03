@@ -118,3 +118,14 @@ startup migration runner handles the new channel constraint. Real provider
 credentials and a running worker are required for delivery; saving a form does not
 send a test message. Delivery is at least once with up to eight attempts, so signed
 webhook receivers should deduplicate submission IDs.
+
+### Website contact inbox
+
+The public website uses `POST /v1/site-contact`, independently of tenant forms.
+Migration `009_site_contact_messages.sql` creates its dedicated table and is
+applied on backend startup. Deploy this backend together with the frontend.
+`GET /v1/admin/site-contact?page=1&limit=20` and
+`DELETE /v1/admin/site-contact/:id` require a super or sudo account; tenant
+accounts are denied. The frontend exposes this inbox as **Form submissions**.
+Messages remain until deleted by a service administrator. No public form key,
+email provider, worker, or tenant destination is needed to receive these messages.

@@ -66,6 +66,20 @@ function mapDestination(row: pg.QueryResultRow, key: string): DestinationRecord 
 }
 
 export class PostgresStore implements Store {
+  async saveSiteContact(input: { name: string; email: string; message: string }, key: string) {
+    await this.pool.query(`INSERT INTO site_contact_messages(name,email,message,idempotency_key)
+      VALUES ($1,$2,$3,$4) ON CONFLICT (idempotency_key) DO NOTHING`, [input.name, input.email, input.message, key]);
+  }
+  async listSiteContacts(page: number, limit: number) {
+    const { rows } = await this.pool.query(`SELECT id,name,email,message,created_at AS "createdAt"
+      FROM site_contact_messages ORDER BY created_at DESC,id DESC LIMIT $1 OFFSET $2`, [limit, (page - 1) * limit]);
+    const count = await this.pool.query("SELECT count(*) FROM site_contact_messages");
+    return { messages: rows.map(row => ({ id: row.id as string, name: row.name as string, email: row.email as string, message: row.message as string, createdAt: new Date(row.createdAt).toISOString() })), total: Number(count.rows[0].count) };
+  }
+  async deleteSiteContact(id: string) {
+    return (await this.pool.query("DELETE FROM site_contact_messages WHERE id=$1", [id])).rowCount === 1;
+  }
+
   async withLoginState<T>(key: string, action: (state: import("../login-lockout.js").LoginState) => Promise<T>): Promise<T> {
     const client = await this.pool.connect();
     try {
