@@ -106,6 +106,13 @@ Provider response bodies and SMTP errors are not retained because they can expos
 credentials. HTTP connections reject private addresses and redirects and pin DNS
 resolution; custom SMTP requires TLS and a public host.
 
+SMTP uses a separate `SMTP_TIMEOUT_MS` setting (30 seconds by default), rather
+than the shorter webhook timeout. Public IPv4 addresses are preferred when a
+host also advertises IPv6, to support deployments without outbound IPv6.
+Failed jobs retain safe error categories for authentication, connection, TLS,
+and sender/recipient rejection without retaining provider responses. Inspect
+`outbox_jobs.last_error` when diagnosing missing mail.
+
 Apply migration 007 and deploy both app and worker, plus the frontend. The API's
 startup migration runner handles the new channel constraint. Real provider
 credentials and a running worker are required for delivery; saving a form does not

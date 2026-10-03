@@ -1,3 +1,4 @@
+import { publicDeliveryError } from "../delivery-errors.js";
 import pg from "pg";
 import { encryptDestination, decryptDestination } from "../integrations.js";
 import { tenantSlug } from "../tenant-name.js";
@@ -638,10 +639,10 @@ export class PostgresStore implements Store {
   }
 
   async deliveryStatus(publicKey: string, submissionId: string): Promise<JsonObject[]> {
-    const result = await this.pool.query(`SELECT j.id,d.kind,j.status,j.attempts FROM outbox_jobs j
+    const result = await this.pool.query(`SELECT j.id,d.kind,j.status,j.attempts,j.last_error FROM outbox_jobs j
       JOIN destinations d ON d.id=j.destination_id JOIN submissions s ON s.id=j.submission_id
       JOIN forms f ON f.id=s.form_id WHERE f.public_key=$1 AND s.id=$2 ORDER BY j.created_at`, [publicKey, submissionId]);
-    return result.rows;
+    return result.rows.map(({ last_error, ...row }) => ({ ...row, error: row.status === "delivered" ? null : publicDeliveryError(last_error) }));
   }
 
   async findReplySubmissions(publicKey: string, filters: ReplyFilters): Promise<string[]> {

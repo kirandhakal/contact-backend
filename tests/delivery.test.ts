@@ -20,6 +20,32 @@ beforeEach(() => {
   mocks.request.mockImplementation((_options, callback) => Object.assign(new EventEmitter(), { end: (body: string) => { mocks.body = body; callback({ statusCode: mocks.status, resume: vi.fn() }); } }));
 });
 describe("delivery adapters", () => {
+  it("prefers public IPv4 when DNS returns IPv6 first", async () => {
+    mocks.lookup.mockResolvedValue([{ address: "2607:f8b0:400e:c00::6c", family: 6 }, { address: "93.184.216.34", family: 4 }]);
+    await deliverJob(job("email", { smtpHost: "smtp.example.com", smtpPort: 587, smtpUser: "user", from: "hello@example.com", to: "alex@example.com" }, "password"), config);
+    expect(mocks.transport).toHaveBeenCalledWith(expect.objectContaining({ host: "93.184.216.34", connectionTimeout: 30000, greetingTimeout: 30000, socketTimeout: 30000 }));
+  });
+  it("still rejects mixed public and private DNS answers", async () => {
+    mocks.lookup.mockResolvedValue([{ address: "93.184.216.34", family: 4 }, { address: "::1", family: 6 }]);
+    await expect(deliverJob(job("email", { smtpHost: "smtp.example.com", smtpPort: 587, to: "alex@example.com" }), config)).rejects.toThrow("public address");
+    expect(mocks.transport).not.toHaveBeenCalled();
+  });
+  it("applies SMTP timeouts to the service transport", async () => {
+    await deliverJob(job("email", { to: "alex@example.com" }), { ...config, SMTP_TIMEOUT_MS: 45000 });
+    expect(mocks.transport).toHaveBeenCalledWith({ url: config.SMTP_URL, connectionTimeout: 45000, greetingTimeout: 45000, socketTimeout: 45000 });
+  });
+  it.each([
+    ["EAUTH", "authentication failed"], ["ETIMEDOUT", "connection timed out"],
+    ["ESOCKET", "connection failed"], ["ECONNECTION", "connection failed"],
+    ["ETLS", "TLS negotiation failed"], ["EENVELOPE", "rejected the sender or recipient"],
+    ["UNKNOWN", "Email delivery failed"],
+  ])("reports a safe actionable error for %s and closes the transport", async (code, reason) => {
+    mocks.sendMail.mockRejectedValue(Object.assign(new Error("private provider response and password"), { code }));
+    const result = deliverJob(job("email", { to: "alex@example.com" }), config);
+    await expect(result).rejects.toThrow(reason);
+    await expect(result).rejects.not.toThrow("private provider");
+    expect(mocks.close).toHaveBeenCalledOnce();
+  });
   it("sends custom SMTP confirmations using a pinned public address and verified TLS", async () => {
     await deliverJob(job("email", { smtpHost: "smtp.example.com", smtpPort: 587, smtpUser: "user", from: "hello@example.com", recipientField: "email", subject: "Hello {{name}}", template: "Thanks {{name}}" }, "smtp-password"), config);
     expect(mocks.transport).toHaveBeenCalledWith(expect.objectContaining({ host: "93.184.216.34", requireTLS: true, tls: expect.objectContaining({ servername: "smtp.example.com" }), auth: { user: "user", pass: "smtp-password" } }));

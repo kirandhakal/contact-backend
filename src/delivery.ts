@@ -1,3 +1,4 @@
+import { smtpFailureReasons } from "./delivery-errors.js";
 import { createHmac } from "node:crypto";
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
@@ -38,7 +39,8 @@ function recipient(job: OutboxJob): string {
 async function publicHost(hostname: string) {
   const addresses = await lookup(hostname, { all: true, verbatim: true });
   if (!addresses.length || addresses.some(({ address }) => !isPublicAddress(address))) throw new Error("Integration host must resolve to a public address");
-  return addresses[0];
+  // Prefer IPv4 on hosts without outbound IPv6, after validating every result.
+  return addresses.find(address => address.family === 4) ?? addresses[0];
 }
 
 // Pin the checked address for the connection to avoid DNS rebinding. TLS still verifies the original hostname.
@@ -61,6 +63,8 @@ async function postPublic(url: string, body: string, headers: Record<string, str
 
 async function deliverEmail(job: OutboxJob, config: AppConfig): Promise<void> {
   const settings = job.destination.config;
+  const to = recipient(job);
+  const timeouts = { connectionTimeout: config.SMTP_TIMEOUT_MS, greetingTimeout: config.SMTP_TIMEOUT_MS, socketTimeout: config.SMTP_TIMEOUT_MS };
   let transport;
   if (typeof settings.smtpHost === "string") {
     const address = await publicHost(settings.smtpHost);
@@ -68,16 +72,20 @@ async function deliverEmail(job: OutboxJob, config: AppConfig): Promise<void> {
     transport = nodemailer.createTransport({ host: address.address, port: Number(settings.smtpPort),
       secure: settings.smtpPort === 465, requireTLS: true, tls: { servername: settings.smtpHost, minVersion: "TLSv1.2" },
       auth: { user: String(settings.smtpUser), pass: job.destination.secret ?? "" },
-      connectionTimeout: config.WEBHOOK_TIMEOUT_MS, greetingTimeout: config.WEBHOOK_TIMEOUT_MS, socketTimeout: config.WEBHOOK_TIMEOUT_MS });
+      ...timeouts });
   } else {
     if (!config.SMTP_URL) throw new Error("Service SMTP is not configured; choose a custom SMTP server");
-    transport = nodemailer.createTransport(config.SMTP_URL);
+    transport = nodemailer.createTransport({ url: config.SMTP_URL, ...timeouts });
   }
   try {
     await transport.sendMail({ from: typeof settings.from === "string" ? settings.from : config.EMAIL_FROM,
-      to: recipient(job), subject: cleanEmailSubject(typeof settings.subject === "string" ? renderTemplate(settings.subject, job) : undefined),
+      to, subject: cleanEmailSubject(typeof settings.subject === "string" ? renderTemplate(settings.subject, job) : undefined),
       text: message(job), disableFileAccess: true, disableUrlAccess: true });
-  } catch { throw new Error("Email delivery failed; check SMTP credentials, sender, and recipient"); }
+  } catch (error) {
+    // Never persist raw provider responses: they can contain credentials or message data.
+    const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
+    throw new Error(typeof code === "string" && Object.hasOwn(smtpFailureReasons, code) ? smtpFailureReasons[code] : "Email delivery failed; check SMTP credentials, sender, and recipient");
+  }
   finally { transport.close(); }
 }
 
