@@ -461,6 +461,16 @@ export class PostgresStore implements Store {
     return result.rowCount ? result.rows[0].tenant_id as string : null;
   }
 
+  async deleteForm(publicKey: string): Promise<boolean> {
+    const result = await this.pool.query("delete from forms where public_key=$1", [publicKey]);
+    return Boolean(result.rowCount);
+  }
+
+  async deleteSubmission(submissionId: string): Promise<boolean> {
+    const result = await this.pool.query("delete from submissions where id=$1", [submissionId]);
+    return Boolean(result.rowCount);
+  }
+
   async updateSubmission(submissionId: string, payload: JsonObject, status: SubmissionStatus): Promise<boolean> {
     const result = await this.pool.query("update submissions set payload=$2, status=$3 where id=$1", [submissionId, payload, status]);
     return (result.rowCount ?? 0) > 0;

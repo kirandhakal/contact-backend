@@ -160,6 +160,8 @@ export interface Store {
   updateTenantLimits(tenantId: string, limits: TenantLimits): Promise<boolean>;
   getForm(publicKey: string): Promise<FormRecord | null>;
   updateForm(publicKey: string, input: Partial<Pick<CreateFormInput, "name" | "allowedOrigins" | "successMessage" | "schema" | "destinations">> & { status?: "active" | "disabled" }): Promise<FormRecord | null>;
+  deleteForm(publicKey: string): Promise<boolean>;
+  deleteSubmission(submissionId: string): Promise<boolean>;
   updateSubmission(submissionId: string, payload: JsonObject, status: SubmissionStatus): Promise<boolean>;
   getTenantIdForSubmission(submissionId: string): Promise<string | null>;
   getTenantIdForForm(publicKey: string): Promise<string | null>;
