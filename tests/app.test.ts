@@ -31,6 +31,7 @@ const config = {
   SMTP_URL: "",
   EMAIL_FROM: "forms@example.com",
   WEBHOOK_TIMEOUT_MS: 5000,
+  SMTP_TIMEOUT_MS: 30000,
   TURNSTILE_SECRET_KEY: ""
 };
 
