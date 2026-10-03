@@ -1,3 +1,4 @@
+import { smtpFailureReasons } from "./delivery-errors.js";
 import { createHmac } from "node:crypto";
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
@@ -83,15 +84,7 @@ async function deliverEmail(job: OutboxJob, config: AppConfig): Promise<void> {
   } catch (error) {
     // Never persist raw provider responses: they can contain credentials or message data.
     const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
-    const reasons: Record<string, string> = {
-      EAUTH: "SMTP authentication failed; check the username and password or provider app password",
-      ETIMEDOUT: "SMTP connection timed out; check outbound SMTP access and the server port",
-      ESOCKET: "SMTP connection failed; check network access and TLS settings",
-      ECONNECTION: "SMTP connection failed; check the server hostname and port",
-      ETLS: "SMTP TLS negotiation failed; check the server and connection settings",
-      EENVELOPE: "SMTP rejected the sender or recipient; check both email addresses and sender permissions",
-    };
-    throw new Error(typeof code === "string" && Object.hasOwn(reasons, code) ? reasons[code] : "Email delivery failed; check SMTP credentials, sender, and recipient");
+    throw new Error(typeof code === "string" && Object.hasOwn(smtpFailureReasons, code) ? smtpFailureReasons[code] : "Email delivery failed; check SMTP credentials, sender, and recipient");
   }
   finally { transport.close(); }
 }
