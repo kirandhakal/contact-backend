@@ -775,6 +775,27 @@ export function buildApp(config: AppConfig, store: Store) {
     }
   );
 
+  app.delete<{ Params: { publicKey: string } }>("/v1/admin/forms/:publicKey", async (request, reply) => {
+    if (!sameOrigin(request)) return problem(reply, 403, "Forbidden", "Invalid origin.");
+    const actor = await adminFor(request);
+    if (!actor) return problem(reply, 401, "Unauthorized", "Sign in required.");
+    const tenantId = await store.getTenantIdForForm(request.params.publicKey);
+    if (!tenantId || (actor.role === "tenant" && tenantId !== actor.tenantId)) return problem(reply, 404, "Not found", "Form not found.");
+    if (!await store.deleteForm(request.params.publicKey)) return problem(reply, 404, "Not found", "Form not found.");
+    return { ok: true };
+  });
+
+  app.delete<{ Params: { submissionId: string } }>("/v1/admin/submissions/:submissionId", async (request, reply) => {
+    if (!sameOrigin(request)) return problem(reply, 403, "Forbidden", "Invalid origin.");
+    const actor = await adminFor(request);
+    if (!actor) return problem(reply, 401, "Unauthorized", "Sign in required.");
+    if (!z.string().uuid().safeParse(request.params.submissionId).success) return problem(reply, 400, "Invalid ID", "Use a valid submission ID.");
+    const tenantId = await store.getTenantIdForSubmission(request.params.submissionId);
+    if (!tenantId || (actor.role === "tenant" && tenantId !== actor.tenantId)) return problem(reply, 404, "Not found", "Submission not found.");
+    if (!await store.deleteSubmission(request.params.submissionId)) return problem(reply, 404, "Not found", "Submission not found.");
+    return { ok: true };
+  });
+
   app.patch<{ Params: { submissionId: string } }>("/v1/admin/submissions/:submissionId", async (request, reply) => {
     if (!sameOrigin(request)) return problem(reply, 403, "Forbidden", "Invalid origin.");
     const admin = await adminFor(request);

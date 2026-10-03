@@ -124,6 +124,17 @@ class MemoryStore implements Store {
     return form;
   }
   async getTenantIdForSubmission(submissionId: string) { return this.submissions.find((item) => item.id === submissionId)?.tenantId ?? null; }
+  async deleteForm(key: string) {
+    const form = this.forms.get(key);
+    if (!form) return false;
+    this.submissions = this.submissions.filter(s => s.formId !== form.id);
+    return this.forms.delete(key);
+  }
+  async deleteSubmission(id: string) {
+    const count = this.submissions.length;
+    this.submissions = this.submissions.filter(s => s.id !== id);
+    return this.submissions.length !== count;
+  }
   async updateSubmission(submissionId: string, payload: JsonObject, status: SubmissionStatus) {
     const item = this.submissions.find((entry) => entry.id === submissionId); if (!item) return false;
     item.payload = payload; item.status = status; return true;
@@ -599,6 +610,22 @@ describe("contact form API", () => {
       headers: { cookie, origin: config.PUBLIC_BASE_URL }, payload: { status: "disabled" }
     });
     expect(cannotDisableOther.statusCode).toBe(404);
+    const headers = { cookie, origin: config.PUBLIC_BASE_URL };
+    const ownSubmission = await app.inject({ method: "POST", url: `/v1/admin/forms/${body.publicKey}/test`, headers, payload: { payload: { name: "Delete test", email: "delete@example.com", message: "Test message", topic: "sales" }, send: true, requestId: randomUUID() } });
+    expect(ownSubmission.statusCode).toBe(202);
+    const submissionId = store.submissions[0].id;
+    expect((await app.inject({ method: "DELETE", url: `/v1/admin/submissions/${submissionId}`, headers: { origin: config.PUBLIC_BASE_URL } })).statusCode).toBe(401);
+    expect((await app.inject({ method: "DELETE", url: `/v1/admin/submissions/${submissionId}`, headers: { cookie, origin: "https://evil.example" } })).statusCode).toBe(403);
+    expect((await app.inject({ method: "DELETE", url: `/v1/admin/submissions/${submissionId}`, headers })).statusCode).toBe(200);
+    expect(store.submissions).toHaveLength(0);
+    expect((await app.inject({ method: "DELETE", url: `/v1/admin/submissions/${submissionId}`, headers })).statusCode).toBe(404);
+    const otherSubmission = await app.inject({ method: "POST", url: `/v1/admin/forms/${otherKey}/test`, headers: { authorization: `Bearer ${config.ADMIN_API_KEY}` }, payload: { payload: {}, send: true, requestId: randomUUID() } });
+    expect(otherSubmission.statusCode).toBe(202);
+    const otherId = otherSubmission.json().submissionId;
+    expect((await app.inject({ method: "DELETE", url: `/v1/admin/submissions/${otherId}`, headers })).statusCode).toBe(404);
+    expect(store.submissions.some(s => s.id === otherId)).toBe(true);
+
+    expect((await app.inject({ method: "DELETE", url: `/v1/admin/forms/${otherKey}`, headers })).statusCode).toBe(404);
     const disableOwn = await app.inject({
       method: "PATCH", url: `/v1/admin/forms/${body.publicKey}`,
       headers: { cookie, origin: config.PUBLIC_BASE_URL }, payload: { status: "disabled" }
@@ -606,6 +633,8 @@ describe("contact form API", () => {
     expect(disableOwn.statusCode).toBe(200);
     const allowed = await app.inject({ method: "GET", url: `/v1/admin/forms/${body.publicKey}/submissions`, headers: { cookie } });
     expect(allowed.statusCode).toBe(200);
+    expect((await app.inject({ method: "DELETE", url: `/v1/admin/forms/${body.publicKey}`, headers })).statusCode).toBe(200);
+    expect(await store.getForm(body.publicKey)).toBeNull();
   });
   it("creates a form through the admin endpoint", async () => {
     const { body } = await createTestForm(new MemoryStore());
