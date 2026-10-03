@@ -122,6 +122,9 @@ export interface OutboxJob {
 }
 
 export interface Store {
+  findReplySubmissions(publicKey: string, filters: import("./management.js").ReplyFilters): Promise<string[]>;
+  queueReplies(publicKey: string, submissionIds: string[], destinationIds: string[], message: string, requestId: string, subject?: string): Promise<number>;
+  deliveryStatus(publicKey: string, submissionId: string): Promise<JsonObject[]>;
   getFormDestinations(publicKey: string): Promise<DestinationRecord[]>;
   withLoginState<T>(key: string, action: (state: import("./login-lockout.js").LoginState) => Promise<T>): Promise<T>;
   managementPage(resource: "forms" | "tenants" | "submissions", query: import("./management.js").ListQuery, publicKey?: string): Promise<import("./management.js").PageResult>;
@@ -131,6 +134,7 @@ export interface Store {
   createForm(input: CreateFormInput, publicKey: string): Promise<FormRecord>;
   getActiveForm(publicKey: string): Promise<FormRecord | null>;
   createSubmission(args: {
+    skipAutomatic?: boolean;
     form: FormRecord;
     payload: JsonObject;
     status: SubmissionStatus;

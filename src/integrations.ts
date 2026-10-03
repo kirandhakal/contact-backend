@@ -30,6 +30,9 @@ export function validateDestinations(value: unknown, schema: JsonObject, existin
   const parsed = z.array(destinationSchema).max(20).parse(value);
   const seen = new Set<string>();
   return parsed.map(item => {
+    const { deliveryMode, ...settings } = item.config;
+    const mode = z.enum(["automatic", "manual"]).optional().parse(deliveryMode);
+    item.config = settings;
     const old = item.id ? existing.find(d => d.id === item.id && d.kind === item.kind) : undefined;
     if (item.id && (!old || seen.has(item.id))) throw new Error("Unknown or duplicate integration.");
     if (item.id) seen.add(item.id);
@@ -62,7 +65,7 @@ export function validateDestinations(value: unknown, schema: JsonObject, existin
         if (!["form.name", "submission.id", "submission.createdAt"].includes(key) && !Object.hasOwn(properties ?? {}, key)) throw new Error(`Unknown template field: ${key}`);
       }
     }
-    return { kind: item.kind, config, ...(secret ? { secret } : {}) };
+    return { kind: item.kind, config: { ...config, ...(mode ? { deliveryMode: mode } : {}) }, ...(secret ? { secret } : {}) };
   });
 }
 

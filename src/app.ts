@@ -3,7 +3,7 @@ import { tenantSlug } from "./tenant-name.js";
 import { checkLogin } from "./login-lockout.js";
 import { createRequire } from "node:module";
 import { z } from "zod";
-import { listQuery } from "./management.js";
+import { listQuery, replyFilters } from "./management.js";
 import { Ajv2020, type ErrorObject } from "ajv/dist/2020.js";
 import type { FormatsPlugin } from "ajv-formats";
 import Fastify, { type FastifyError, type FastifyReply } from "fastify";
@@ -353,7 +353,11 @@ export function buildApp(config: AppConfig, store: Store) {
     if (!parsed.success || (parsed.data.status && !["active", "disabled"].includes(parsed.data.status))) return problem(reply, 400, "Invalid filters", "Use valid pagination and active/disabled status.");
     if (actor.role === "tenant") parsed.data.tenantId = actor.tenantId!;
     const result = await store.managementPage("forms", parsed.data);
-    return { forms: result.items, pagination: result.pagination };
+    const forms = await Promise.all(result.items.map(async item => {
+      const destinations = await store.getFormDestinations(String(item.publicKey));
+      return { ...item, submitUrl: `${config.PUBLIC_BASE_URL}/v1/forms/${item.publicKey}/submissions`, automaticRules: destinations.filter(d => d.config.deliveryMode !== "manual").length, manualRules: destinations.filter(d => d.config.deliveryMode === "manual").length };
+    }));
+    return { forms, pagination: result.pagination };
   });
 
   app.get("/v1/admin/submissions", async (request, reply) => {
@@ -577,6 +581,80 @@ export function buildApp(config: AppConfig, store: Store) {
     if (!Object.keys(changes).length) return problem(reply, 422, "Invalid request", "No supported form changes were supplied.");
     const form = await store.updateForm(request.params.publicKey, changes);
     return { publicKey: request.params.publicKey, form };
+  });
+
+  app.post<{ Params: { publicKey: string } }>("/v1/admin/forms/:publicKey/test", async (request, reply) => {
+    const actor = await adminFor(request);
+    if (!actor) return problem(reply, 401, "Unauthorized", "Sign in required.");
+    if (!sameOrigin(request) && actor.id !== "service-key") return problem(reply, 403, "Forbidden", "Invalid origin.");
+    const form = await store.getForm(request.params.publicKey);
+    if (!form || (actor.role === "tenant" && actor.tenantId !== form.tenantId)) return problem(reply, 404, "Not found", "Form not found.");
+    const parsed = z.object({ payload: z.record(z.unknown()), send: z.boolean().default(false), requestId: z.string().uuid(), destinationIds: z.array(z.string().uuid()).max(20).optional() }).strict().safeParse(request.body);
+    if (!parsed.success) return problem(reply, 422, "Invalid test", "Supply sample data and a request ID.");
+    const payload = { ...parsed.data.payload };
+    if (payload[form.honeypotField]) return problem(reply, 422, "Invalid test", "Leave the honeypot empty.");
+    delete payload[form.honeypotField];
+    if (!isBoundedJsonSchema(form.schema)) return problem(reply, 422, "Invalid schema", "Stored schema exceeds complexity limits.");
+    const validate = schemaAjv.compile(form.schema);
+    if (!validate(payload)) return problem(reply, 422, "Validation failed", validationErrors(validate.errors).map(e => `${e.path}: ${e.message}`).join("; "));
+    const destinations = await store.getFormDestinations(form.publicKey);
+    if (parsed.data.destinationIds?.some(id => !destinations.some(d => d.id === id))) return problem(reply, 422, "Invalid integration", "Reload the form to select current integrations.");
+    if (!parsed.data.send) return { message: "Sample data is valid. Nothing was saved or sent.", automaticRules: destinations.filter(d => d.config.deliveryMode !== "manual").length };
+    if (form.status !== "active") return problem(reply, 422, "Disabled form", "Enable the form before sending a test.");
+    const usage = await store.getTenantLimits(form.tenantId);
+    if (usage && (usage.totalSubmissions >= usage.maxTotalSubmissions || usage.dailySubmissions >= usage.maxDailySubmissions)) return problem(reply, 429, "Limit reached", "Submission allowance reached.");
+    if (!limiter.check(`admin-test:${actor.id}:${form.id}`).allowed) return problem(reply, 429, "Rate limit exceeded", "Too many test submissions.");
+    const result = await store.createSubmission({ form, payload, skipAutomatic: parsed.data.destinationIds !== undefined, status: "accepted", sourceOrigin: "admin-test", sourceIpHash: hashIp(request.ip, config.DATA_ENCRYPTION_KEY),
+      idempotencyKey: `test-${parsed.data.requestId}`, accessTokenHash: hashSubmissionAccessToken(newSubmissionAccessToken()), expiresAt: new Date(Date.now() + config.RETENTION_DAYS * 86400000) });
+    const ids = parsed.data.destinationIds;
+    const queued = ids?.length ? await store.queueReplies(form.publicKey, [result.submission.id], [...new Set(ids)], "", parsed.data.requestId) : 0;
+    return reply.code(202).send({ message: ids ? `Test submission saved with the same field data. ${queued} selected integration messages queued.` : "Test submission saved. Automatic messages are queued; check delivery status below.", submissionId: result.submission.id });
+  });
+
+  app.get<{ Params: { publicKey: string; submissionId: string } }>("/v1/admin/forms/:publicKey/delivery/:submissionId", async (request, reply) => {
+    const actor = await adminFor(request);
+    if (!actor) return problem(reply, 401, "Unauthorized", "Sign in required.");
+    const tenantId = await store.getTenantIdForForm(request.params.publicKey);
+    if (!tenantId || (actor.role === "tenant" && actor.tenantId !== tenantId)) return problem(reply, 404, "Not found", "Form not found.");
+    if (!z.string().uuid().safeParse(request.params.submissionId).success) return problem(reply, 422, "Invalid request", "Invalid submission ID.");
+    return { deliveries: await store.deliveryStatus(request.params.publicKey, request.params.submissionId) };
+  });
+
+  app.post<{ Params: { publicKey: string } }>("/v1/admin/forms/:publicKey/replies/preview", async (request, reply) => {
+    const actor = await adminFor(request);
+    if (!actor) return problem(reply, 401, "Unauthorized", "Sign in required.");
+    if (!sameOrigin(request) && actor.id !== "service-key") return problem(reply, 403, "Forbidden", "Invalid origin.");
+    const tenantId = await store.getTenantIdForForm(request.params.publicKey);
+    if (!tenantId || (actor.role === "tenant" && actor.tenantId !== tenantId)) return problem(reply, 404, "Not found", "Form not found.");
+    const filters = replyFilters.safeParse(request.body);
+    if (!filters.success) return problem(reply, 422, "Invalid filters", "Check the search, dates and field filters.");
+    const ids = await store.findReplySubmissions(request.params.publicKey, filters.data);
+    return { matched: ids.length, overLimit: ids.length > 10000 };
+  });
+
+  app.post<{ Params: { publicKey: string } }>("/v1/admin/forms/:publicKey/replies", async (request, reply) => {
+    const actor = await adminFor(request);
+    if (!actor) return problem(reply, 401, "Unauthorized", "Sign in required.");
+    if (!sameOrigin(request) && actor.id !== "service-key") return problem(reply, 403, "Forbidden", "Invalid origin.");
+    const form = await store.getForm(request.params.publicKey);
+    if (!form || (actor.role === "tenant" && actor.tenantId !== form.tenantId)) return problem(reply, 404, "Not found", "Form not found.");
+    const parsed = z.object({ submissionIds: z.array(z.string().uuid()).min(1).max(100).optional(), filters: replyFilters.optional(), subject: z.string().trim().min(1).max(200).optional(), destinationIds: z.array(z.string().uuid()).min(1).max(20), message: z.string().trim().min(1).max(8000), requestId: z.string().uuid() }).strict().refine(v => !!v.submissionIds !== !!v.filters).safeParse(request.body);
+    if (!parsed.success) return problem(reply, 422, "Invalid reply", "Select up to 100 submissions, integrations, and a message.");
+    if (!limiter.check(`bulk-reply:${actor.id}:${form.id}`).allowed) return problem(reply, 429, "Rate limit exceeded", "Too many bulk reply requests.");
+    try {
+      const destinations = await store.getFormDestinations(form.publicKey);
+      const selected = destinations.filter(d => parsed.data.destinationIds.includes(d.id));
+      if (selected.length !== new Set(parsed.data.destinationIds).size) return problem(reply, 422, "Invalid integration", "An integration is no longer available. Reload the form.");
+      validateDestinations(selected.map(d => ({ kind: d.kind, config: { ...d.config, template: parsed.data.message, ...(d.kind === "email" && parsed.data.subject ? { subject: parsed.data.subject } : {}) }, secret: d.secret ?? undefined })), form.schema);
+      const ids = [...new Set(parsed.data.submissionIds ?? await store.findReplySubmissions(form.publicKey, parsed.data.filters!))];
+      if (!ids.length || ids.length > 10000) return problem(reply, 422, "Invalid audience", "Select between 1 and 10,000 accepted submissions. Narrow the filters if needed.");
+      const queued = await store.queueReplies(form.publicKey, ids, [...new Set(parsed.data.destinationIds)], parsed.data.message, parsed.data.requestId, parsed.data.subject);
+      return reply.code(202).send({ queued, message: `${queued} messages queued. Submissions without a valid recipient for the chosen channel are skipped.` });
+    } catch (error) {
+      if (error instanceof z.ZodError) return problem(reply, 422, "Invalid reply", "Check the message length for the selected channels.");
+      if (error instanceof Error && (/Select accepted|Message exceeds|Form not found|Unknown template field/.test(error.message))) return problem(reply, 422, "Invalid reply", error.message);
+      throw error;
+    }
   });
 
   app.post<{ Params: { publicKey: string } }>("/v1/forms/:publicKey/submissions", async (request, reply) => {

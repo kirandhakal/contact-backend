@@ -92,7 +92,7 @@ async function deliverSms(job: OutboxJob, config: AppConfig): Promise<void> {
 async function deliverWebhook(job: OutboxJob, config: AppConfig): Promise<void> {
   const url = job.destination.config.url;
   if (!isSafeWebhookUrl(url) || !job.destination.secret) throw new Error("Invalid webhook configuration");
-  const body = JSON.stringify({ id: job.submission.id, type: "form.submission.created", createdAt: job.submission.createdAt,
+  const body = JSON.stringify({ id: job.submission.id, deliveryId: job.id, type: job.destination.config.eventType === "form.reply.created" ? "form.reply.created" : "form.submission.created", createdAt: job.submission.createdAt,
     form: { id: job.form.id, name: job.form.name }, data: job.submission.payload,
     ...(job.destination.config.template ? { message: message(job) } : {}) });
   const timestamp = Math.floor(Date.now() / 1000).toString();

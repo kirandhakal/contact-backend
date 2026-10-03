@@ -5,6 +5,10 @@ const schema = { type: "object", required: ["email", "phone"], properties: { ema
 const email = { kind: "email", config: { recipientField: "email", subject: "Thanks {{name}}", template: "Hello {{name}}", smtpHost: "smtp.example.com", smtpPort: 587, smtpUser: "mailer", from: "hello@example.com" }, secret: "a-private-password" };
 
 describe("integration configuration", () => {
+  it("preserves manual and automatic modes and rejects unknown triggers", () => {
+    for (const deliveryMode of ["manual", "automatic"]) expect(validateDestinations([{ ...email, config: { ...email.config, deliveryMode } }], schema)[0].config.deliveryMode).toBe(deliveryMode);
+    expect(() => validateDestinations([{ ...email, config: { ...email.config, deliveryMode: "sometimes" } }], schema)).toThrow();
+  });
   it("validates channels, recipients, and required form fields", () => {
     expect(validateDestinations([email], schema)).toHaveLength(1);
     expect(() => validateDestinations([{ ...email, config: { ...email.config, recipientField: "name" } }], schema)).toThrow(/required/);

@@ -92,12 +92,77 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)("PostgreSQL management integrati
       expect(result.retryAfterSeconds).toBeGreaterThan(0);
     } finally { await second.close(); }
   });
+  it("queues automatic rules only, supports manual bulk replies, rejects foreign submissions, and deduplicates retries", async () => {
+    const tenant = await store.createTenant("Reply tests");
+    const publicKey = `frm_${randomUUID()}`;
+    try {
+      const form = await store.createForm({ tenantName: "Reply tests", tenantId: tenant, name: "Replies", allowedOrigins: ["https://example.com"], schema: { type: "object" }, destinations: [
+        { kind: "email", config: { recipientField: "email", deliveryMode: "manual", template: "Manual" } },
+        { kind: "discord", config: { deliveryMode: "automatic", template: "New submission" }, secret: "https://discord.com/api/webhooks/123/test-token" }
+      ] }, publicKey);
+      const result = await store.createSubmission({ form, payload: { name: "Alex Morgan", email: "alex@example.com" }, status: "accepted", sourceIpHash: "test", accessTokenHash: "test", expiresAt: new Date(Date.now() + 60000) });
+      const initial = await store.deliveryStatus(publicKey, result.submission.id);
+      expect(initial).toHaveLength(1); expect(initial[0].kind).toBe("discord");
+      const destinations = await store.getFormDestinations(publicKey);
+      const ids = destinations.map(d => d.id);
+      await expect(store.queueReplies(publicKey, [randomUUID()], ids, "Hello", randomUUID())).rejects.toThrow(/accepted/);
+      await expect(store.queueReplies(publicKey, [result.submission.id], [randomUUID()], "Hello", randomUUID())).rejects.toThrow(/integrations/);
+      const requestId = randomUUID();
+      expect(await Promise.all([1, 2].map(() => store.queueReplies(publicKey, [result.submission.id], ids, "Hello {{name}}", requestId)))).toEqual([2, 2]);
+      expect(await store.deliveryStatus(publicKey, result.submission.id)).toHaveLength(3);
+      expect(await store.getFormDestinations(publicKey)).toHaveLength(2);
+      const jobs = await store.claimJobs(20);
+      expect(jobs.filter(j => j.destination.config.template === "Hello {{name}}")).toHaveLength(2);
+      expect(jobs.every(j => j.submission.id === result.submission.id)).toBe(true);
+      for (const job of jobs) await store.markJobDelivered(job.id);
+      expect((await store.deliveryStatus(publicKey, result.submission.id)).every(d => d.status === "delivered")).toBe(true);
+    } finally { await pool.query("DELETE FROM tenants WHERE id=$1", [tenant]); }
+  });
   it("paginates SQL aggregates and preserves totals on out-of-range pages", async () => {
     const page = await store.managementPage("forms", { ...query, tenantId });
     expect(page.pagination.total).toBe(2); expect(page.items[0]).toMatchObject({ publicKey: key, submissionCount: 2, acceptedCount: 1, spamCount: 1 });
     const beyond = await store.managementPage("forms", { ...query, tenantId, page: 9 });
     expect(beyond.items).toEqual([]); expect(beyond.pagination.total).toBe(2);
     const injection = await store.managementPage("forms", { ...query, q: "' OR 1=1 --" }); expect(injection.items).toEqual([]);
+  });
+  it("tests selected manual integrations and replies to filtered submissions across pages while skipping invalid recipients", async () => {
+    const tenant = await store.createTenant("Filtered replies");
+    const publicKey = `frm_${randomUUID()}`;
+    const config = getConfig({ NODE_ENV: "test", DATABASE_URL: pool.options.connectionString!, ADMIN_API_KEY: "test-admin-key-at-least-24-characters", DATA_ENCRYPTION_KEY: "b".repeat(64), PUBLIC_BASE_URL: "http://localhost:3100" });
+    const app = buildApp(config, store);
+    const headers = { authorization: `Bearer ${config.ADMIN_API_KEY}` };
+    try {
+      const form = await store.createForm({ tenantName: "Filtered replies", tenantId: tenant, name: "Admissions", allowedOrigins: ["https://example.com"], schema: { type: "object", required: ["email"], properties: { name: { type: "string" }, email: { type: "string" }, education: { type: "string", enum: ["SEE", "+2"] }, groups: { type: "array", items: { type: "string", enum: ["Rai", "Limbu"] } } } }, destinations: [
+        { kind: "email", config: { recipientField: "email", deliveryMode: "manual", template: "Thanks {{name}}", subject: "Confirmation" } },
+        { kind: "discord", config: { deliveryMode: "automatic", template: "Admissions" }, secret: "https://discord.com/api/webhooks/123/test-token" }
+      ] }, publicKey);
+      const destinations = await store.getFormDestinations(publicKey);
+      const email = destinations.find(d => d.kind === "email")!;
+      const sample = { name: "Alex Morgan", email: "alex@example.com", education: "SEE", groups: ["Rai"], _website: "" };
+      const testBody = { payload: sample, send: true, destinationIds: [email.id], requestId: randomUUID() };
+      const first = await app.inject({ method: "POST", url: `/v1/admin/forms/${publicKey}/test`, headers, payload: testBody });
+      expect(first.statusCode).toBe(202);
+      const repeated = await app.inject({ method: "POST", url: `/v1/admin/forms/${publicKey}/test`, headers, payload: testBody });
+      expect(repeated.json().submissionId).toBe(first.json().submissionId);
+      expect(await store.deliveryStatus(publicKey, first.json().submissionId)).toMatchObject([{ kind: "email" }]);
+      expect((await store.listSubmissions(publicKey, 10))[0].payload).toEqual({ name: "Alex Morgan", email: "alex@example.com", education: "SEE", groups: ["Rai"] });
+      for (let i = 0; i < 24; i++) await store.createSubmission({ form, payload: { name: `Applicant ${i}`, email: i < 2 ? "invalid" : `person${i}@example.com`, education: i < 22 ? "SEE" : "+2", groups: ["Rai"] }, skipAutomatic: true, status: "accepted", sourceIpHash: "test", accessTokenHash: "test", expiresAt: new Date(Date.now() + 60000) });
+      const fields = { education: ["SEE"], groups: ["Rai"] };
+      const page = await store.managementPage("submissions", { page: 1, limit: 10, q: "", sort: "newest", fields }, publicKey);
+      expect(page.pagination.total).toBe(23); expect(page.items).toHaveLength(10);
+      const path = `/v1/admin/forms/${publicKey}/replies`;
+      const preview = await app.inject({ method: "POST", url: `${path}/preview`, headers, payload: { q: "", fields } });
+      expect(preview.json()).toMatchObject({ matched: 23, overLimit: false });
+      const payload = { filters: { q: "", fields }, destinationIds: destinations.map(d => d.id), message: "Update for {{name}}", subject: "Admission update", requestId: randomUUID() };
+      const sent = await app.inject({ method: "POST", url: path, headers, payload });
+      expect(sent.statusCode).toBe(202); expect(sent.json().queued).toBe(44);
+      expect((await app.inject({ method: "POST", url: path, headers, payload })).json().queued).toBe(44);
+      const jobs = await store.claimJobs(100);
+      expect(jobs).toHaveLength(45);
+      expect(jobs.filter(j => j.destination.config.subject === "Admission update")).toHaveLength(21);
+      expect(await store.findReplySubmissions(publicKey, { q: "", fields: { education: ["' OR 1=1 --"] } })).toEqual([]);
+      expect(await store.findReplySubmissions(publicKey, { q: "", from: "2100-01-01T00:00:00Z" })).toEqual([]);
+    } finally { await app.close(); await pool.query("DELETE FROM tenants WHERE id=$1", [tenant]); }
   });
   it("filters submissions and exposes scoped tenant activity and analytics", async () => {
     const messages = await store.managementPage("submissions", { ...query, tenantId, status: "spam", q: "spam" }, key);
