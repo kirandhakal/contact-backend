@@ -11,4 +11,5 @@ UNIVERSAL_CONTACT_FORM_BACKEND.md
 HOW_TO_USE.md
 tests
 examples
-scripts
+scripts/*
+!scripts/smoke-signup.mjs

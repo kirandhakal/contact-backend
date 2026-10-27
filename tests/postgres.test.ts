@@ -68,6 +68,47 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)("PostgreSQL management integrati
       await pool.query("DELETE FROM tenants WHERE id=$1", [me.json().tenantId]);
     } finally { await app.close(); }
   });
+  it("cleans expired authentication records without deleting active or recent records", async () => {
+    const now = new Date("2020-01-01T00:00:00Z");
+    const ago = (milliseconds: number) => new Date(now.getTime() - milliseconds);
+    const ahead = (milliseconds: number) => new Date(now.getTime() + milliseconds);
+    const expiredChallenge = randomUUID(); const oldConsumedChallenge = randomUUID();
+    const recentExpiredChallenge = randomUUID(); const activeChallenge = randomUUID(); const resetChallenge = randomUUID();
+    const expiredSignup = randomUUID(); const activeSignup = randomUUID();
+    const expiredLimit = `expired:${randomUUID()}`; const activeLimit = `active:${randomUUID()}`;
+    try {
+      for (const [id, email, expiresAt, consumedAt] of [
+        [expiredChallenge, `${expiredChallenge}@example.com`, ago(2 * 86400000), null],
+        [oldConsumedChallenge, `${oldConsumedChallenge}@example.com`, ahead(86400000), ago(2 * 86400000)],
+        [recentExpiredChallenge, `${recentExpiredChallenge}@example.com`, ago(3600000), null],
+        [activeChallenge, `${activeChallenge}@example.com`, ahead(86400000), null]
+      ] as const) {
+        await pool.query(`INSERT INTO auth_challenges (id,purpose,email,otp_hash,expires_at,resend_available_at,consumed_at)
+          VALUES ($1,'signup',$2,'hash',$3,$4,$5)`, [id, email, expiresAt, ago(60000), consumedAt]);
+      }
+      await pool.query(`INSERT INTO auth_challenges (id,purpose,email,otp_hash,expires_at,resend_available_at,consumed_at,reset_token_hash,reset_token_expires_at)
+        VALUES ($1,'password_reset',$2,'hash',$3,$4,$5,$6,$7)`, [resetChallenge, `${resetChallenge}@example.com`,
+        ago(1200000), ago(60000), ago(1800000), `reset-${resetChallenge}`, ahead(300000)]);
+      await pool.query(`INSERT INTO pending_signups (id,email,workspace_name,password_hash,expires_at) VALUES ($1,$2,'Expired','hash',$3),($4,$5,'Active','hash',$6)`,
+        [expiredSignup, `${expiredSignup}@example.com`, ago(1000), activeSignup, `${activeSignup}@example.com`, ahead(3600000)]);
+      await pool.query(`INSERT INTO auth_rate_limits (key,window_started_at,count,expires_at) VALUES ($1,$2,1,$3),($4,$2,1,$5)`,
+        [expiredLimit, ago(3600000), ago(1000), activeLimit, ahead(3600000)]);
+
+      expect(await store.deleteExpiredAuthData(now)).toBe(4);
+      expect(await store.deleteExpiredAuthData(now)).toBe(0);
+
+      const { rows: challengeRows } = await pool.query("SELECT id FROM auth_challenges WHERE id = ANY($1::uuid[]) ORDER BY id",
+        [[expiredChallenge, oldConsumedChallenge, recentExpiredChallenge, activeChallenge, resetChallenge]]);
+      expect(challengeRows.map(row => row.id).sort()).toEqual([recentExpiredChallenge, activeChallenge, resetChallenge].sort());
+      expect((await pool.query("SELECT id FROM pending_signups WHERE id = ANY($1::uuid[])", [[expiredSignup, activeSignup]])).rows.map(row => row.id)).toEqual([activeSignup]);
+      expect((await pool.query("SELECT key FROM auth_rate_limits WHERE key = ANY($1::text[])", [[expiredLimit, activeLimit]])).rows.map(row => row.key)).toEqual([activeLimit]);
+    } finally {
+      await pool.query("DELETE FROM auth_challenges WHERE id = ANY($1::uuid[])", [[expiredChallenge, oldConsumedChallenge, recentExpiredChallenge, activeChallenge, resetChallenge]]);
+      await pool.query("DELETE FROM pending_signups WHERE id = ANY($1::uuid[])", [[expiredSignup, activeSignup]]);
+      await pool.query("DELETE FROM auth_rate_limits WHERE key = ANY($1::text[])", [[expiredLimit, activeLimit]]);
+    }
+  });
+
   it("handles concurrent successful logins without losing the locking row", async () => {
     const { checkLogin } = await import("../src/login-lockout.js");
     const key = randomUUID();

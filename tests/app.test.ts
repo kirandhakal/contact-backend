@@ -1057,6 +1057,29 @@ describe("contact form API", () => {
 
 
 describe("email-verified auth", () => {
+  it("rejects empty and invalid signup payloads without persisting records", async () => {
+    const store = new MemoryStore(); const app = makeApp(store);
+    try {
+      const headers = { origin: config.PUBLIC_BASE_URL };
+      for (const payload of [
+        {},
+        { workspaceName: "Studio", email: "not-an-email", password: "a-secure-password" },
+        { workspaceName: "!!!", email: "workspace@studio.test", password: "a-secure-password" },
+        { workspaceName: "Studio", email: "password@studio.test", password: "short" }
+      ]) {
+        const response = await app.inject({ method: "POST", url: "/v1/auth/signup", headers, payload });
+        expect(response.statusCode).toBe(422);
+        expect(response.json()).toMatchObject({ title: "Invalid request", status: 422 });
+      }
+      expect(store.pendingSignups.size).toBe(0);
+      expect(store.authChallenges.size).toBe(0);
+      expect(store.authRateLimits.size).toBe(0);
+      expect(store.admins.size).toBe(0);
+      expect(store.tenants.size).toBe(0);
+      expect(store.authEmails).toEqual([]);
+    } finally { await app.close(); }
+  });
+
   it("keeps signup pending until the correct code is verified", async () => {
     const store = new MemoryStore(); const app = makeApp(store);
     const payload = { workspaceName: "Secure Studio", email: "secure@studio.test", password: "a-secure-password" };

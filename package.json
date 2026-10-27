@@ -16,6 +16,7 @@
     "docker:down": "docker compose --env-file .env.docker down",
     "docker:local": "bash scripts/docker-local.sh",
     "register:form": "node scripts/register-form.mjs",
+    "smoke:signup": "node scripts/smoke-signup.mjs",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "build": "tsc -p tsconfig.build.json"
