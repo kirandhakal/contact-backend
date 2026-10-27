@@ -18,7 +18,7 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)("PostgreSQL management integrati
     const url = new URL(process.env.TEST_DATABASE_URL!);
     const setup = new pg.Client({ connectionString: url.toString() }); await setup.connect();
     await setup.query(`create schema ${schema}`); await setup.end();
-    url.searchParams.set("options", `-c search_path=${schema},public`);
+    url.searchParams.set("options", `-c search_path=${schema}`);
     pool = new pg.Pool({ connectionString: url.toString() }); store = new PostgresStore(url.toString(), "b".repeat(64));
     for (let pass = 0; pass < 2; pass++) for (const file of (await readdir(new URL("../migrations/", import.meta.url))).filter(f => f.endsWith(".sql")).sort()) await pool.query(await readFile(new URL(`../migrations/${file}`, import.meta.url), "utf8"));
     tenantId = (await store.createSiteAccount("SQL studio", `${schema}@example.com`, await hashPassword("original-password"))).tenantId;
@@ -30,17 +30,32 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)("PostgreSQL management integrati
   afterAll(async () => {
     await store?.close(); if (pool) { await pool.query(`drop schema ${schema} cascade`); await pool.end(); }
   });
+  it("stores website messages separately and deduplicates concurrent retries", async () => {
+    const input = { name: "Website visitor", email: "visitor@example.com", message: "Help with the service please." };
+    const requestId = randomUUID();
+    await Promise.all(Array.from({ length: 5 }, () => store.saveSiteContact(input, requestId)));
+    const result = await store.listSiteContacts(1, 20);
+    expect(result.total).toBe(1); expect(result.messages[0]).toMatchObject(input);
+    expect((await store.listSiteContacts(2, 20)).messages).toEqual([]);
+    expect(await store.deleteSiteContact(result.messages[0].id)).toBe(true);
+    expect((await store.listSiteContacts(1, 20)).total).toBe(0);
+  });
   it("reproduces login failure without the lockout migration and repairs signup/login by migrating", async () => {
     const config = getConfig({ NODE_ENV: "test", DATABASE_URL: pool.options.connectionString!,
       ADMIN_API_KEY: "test-admin-key-at-least-24-characters", DATA_ENCRYPTION_KEY: "a".repeat(64), PUBLIC_BASE_URL: "http://localhost:3100" });
-    const app = buildApp(config, store);
+    const messages: import("../src/auth-email.js").AuthEmailMessage[] = [];
+    const app = buildApp(config, store, { sendAuthEmail: async (message) => { messages.push(message); } });
     const headers = { origin: config.PUBLIC_BASE_URL };
     const email = `${randomUUID()}@example.com`;
     const credentials = { email, password: "signup-test-password", portal: "tenant" };
     try {
-      await pool.query("DROP TABLE login_lockouts");
+      await pool.query(`DROP TABLE ${schema}.login_lockouts`);
       const signup = await app.inject({ method: "POST", url: "/v1/auth/signup", headers, payload: { workspaceName: "Café & Company", email, password: credentials.password } });
       expect(signup.statusCode).toBe(202);
+      const code = messages.find(message => message.to === email && message.kind === "signup_code");
+      if (!code || !("code" in code)) throw new Error("Signup code was not created");
+      const verify = await app.inject({ method: "POST", url: "/v1/auth/signup/verify", headers, payload: { challengeId: signup.json().challengeId, code: code.code } });
+      expect(verify.statusCode).toBe(200);
       expect((await app.inject({ method: "POST", url: "/v1/admin/login", headers, payload: credentials })).statusCode).toBe(500);
       await migrateDatabase(pool.options.connectionString!);
       const login = await app.inject({ method: "POST", url: "/v1/admin/login", headers, payload: credentials });
@@ -128,7 +143,7 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)("PostgreSQL management integrati
   it("tests selected manual integrations and replies to filtered submissions across pages while skipping invalid recipients", async () => {
     const tenant = await store.createTenant("Filtered replies");
     const publicKey = `frm_${randomUUID()}`;
-    const config = getConfig({ NODE_ENV: "test", DATABASE_URL: pool.options.connectionString!, ADMIN_API_KEY: "test-admin-key-at-least-24-characters", DATA_ENCRYPTION_KEY: "b".repeat(64), PUBLIC_BASE_URL: "http://localhost:3100" });
+    const config = getConfig({ NODE_ENV: "test", DATABASE_URL: pool.options.connectionString!, ADMIN_API_KEY: "test-admin-key-at-least-24-characters", DATA_ENCRYPTION_KEY: "b".repeat(64), PUBLIC_BASE_URL: "http://localhost:3100", MAIL_HOST:"", MAIL_PORT:587 as any, MAIL_AUTH:true as any, MAIL_USERNAME:"", MAIL_USER:"", MAIL_PASSWORD:"", MAIL_PASS:"", MAIL_FROM:"", ENABLE_EMAIL:true as any, ENABLE_SMS:true as any, ENABLE_WHATSAPP:true as any, ENABLE_DISCORD:true as any, ENABLE_WEBHOOK:true as any, ENABLE_MAIL:true as any });
     const app = buildApp(config, store);
     const headers = { authorization: `Bearer ${config.ADMIN_API_KEY}` };
     try {

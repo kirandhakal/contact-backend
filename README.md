@@ -57,10 +57,25 @@ application instances. Apply migrations before starting the updated app.
 HTTP 429 includes `Retry-After`, `retryAfterSeconds`, and `lockedUntil`;
 the frontend displays a countdown and disables submission until it expires.
 
-### Signup and schema readiness
+### Email-verified signup and password reset
 
-Successful signup redirects the web app to `/login?signup=complete`; it does not
-attempt an automatic login. Users sign in explicitly after the confirmation.
+Tenant signup now creates a pending account and sends a six-digit code. The
+account and workspace are only created after `POST /v1/auth/signup/verify`
+accepts the correct code. Successful verification redirects the web app to
+`/login?signup=complete`; it does not attempt an automatic login.
+
+Tenant password reset uses `POST /v1/auth/forgot-password`, the matching
+`/verify` and `/resend` endpoints, then `POST /v1/auth/reset-password`. Reset
+tokens are single-use, short-lived, and revoked along with existing sessions.
+Unknown or ineligible emails receive the same response and no code.
+
+Codes are stored as keyed HMAC hashes, never plaintext. Defaults are a 5-minute
+expiry, 60-second resend cooldown, five attempts, and a 15-minute lock. Auth
+rate limits are persisted in PostgreSQL. Configure delivery with `SMTP_URL` or
+the `MAIL_*` variables. Set `OTP_HMAC_KEY` to a dedicated secret, or it falls
+back to `DATA_ENCRYPTION_KEY`. Set `TRUST_PROXY` only when a trusted reverse
+proxy supplies client IP headers. Locked challenges remain locked for 15 minutes.
+
 New workspace/tenant names are normalized with `slugify` (for example,
 `Acme Studio` becomes `acme-studio`). Names that produce an empty slug are rejected.
 Existing tenant names are preserved.
@@ -118,3 +133,14 @@ startup migration runner handles the new channel constraint. Real provider
 credentials and a running worker are required for delivery; saving a form does not
 send a test message. Delivery is at least once with up to eight attempts, so signed
 webhook receivers should deduplicate submission IDs.
+
+### Website contact inbox
+
+The public website uses `POST /v1/site-contact`, independently of tenant forms.
+Migration `009_site_contact_messages.sql` creates its dedicated table and is
+applied on backend startup. Deploy this backend together with the frontend.
+`GET /v1/admin/site-contact?page=1&limit=20` and
+`DELETE /v1/admin/site-contact/:id` require a super or sudo account; tenant
+accounts are denied. The frontend exposes this inbox as **Form submissions**.
+Messages remain until deleted by a service administrator. No public form key,
+email provider, worker, or tenant destination is needed to receive these messages.

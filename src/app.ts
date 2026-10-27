@@ -1,5 +1,8 @@
 import { validateDestinations } from "./integrations.js";
-import { tenantSlug } from "./tenant-name.js";
+import { randomUUID } from "node:crypto";
+import { generateOtp, hashOtp, hashResetToken, isSixDigitCode, newResetToken, normalizeEmail } from "./auth-otp.js";
+import { sendAuthEmail, type AuthEmailMessage } from "./auth-email.js";
+import { formSlug, tenantSlug } from "./tenant-name.js";
 import { checkLogin } from "./login-lockout.js";
 import { createRequire } from "node:module";
 import { z } from "zod";
@@ -21,7 +24,34 @@ import {
   newPublicKey,
   newSubmissionAccessToken
 } from "./security.js";
-import type { AdminRole, CreateFormInput, JsonObject, Store, TenantLimits } from "./types.js";
+import type { AdminRole, AuthChallenge, CreateFormInput, JsonObject, Store, TenantLimits } from "./types.js";
+
+const GENERIC_AUTH_MESSAGE = "We've received your request. If the email is eligible, you will receive a verification code shortly.";
+
+export interface AppDependencies {
+  now?: () => Date;
+  sendAuthEmail?: (message: AuthEmailMessage) => Promise<void>;
+}
+
+function challengeStatusProblem(reply: FastifyReply, result: { status: string; retryAfterSeconds?: number; attemptsRemaining?: number }) {
+  if (result.status === "locked") {
+    const retryAfter = result.retryAfterSeconds && result.retryAfterSeconds > 0 ? result.retryAfterSeconds : 900;
+    reply.header("Retry-After", retryAfter);
+    return problem(reply, 429, "Too many attempts", "Too many incorrect codes. Please wait before trying again.", {
+      code: "OTP_LOCKED", retryAfterSeconds: retryAfter
+    });
+  }
+  if (result.status === "expired") {
+    return problem(reply, 400, "Code expired", "This verification code has expired. Request a new code.", { code: "OTP_EXPIRED" });
+  }
+  return problem(reply, 400, "Invalid code", "The verification code is invalid. Check the code and try again.", {
+    code: "OTP_INVALID", attemptsRemaining: result.attemptsRemaining
+  });
+}
+
+function secondsUntil(date: Date, now: Date): number {
+  return Math.max(0, Math.ceil((date.getTime() - now.getTime()) / 1000));
+}
 
 const require = createRequire(import.meta.url);
 const addFormats = require("ajv-formats") as FormatsPlugin;
@@ -121,7 +151,7 @@ const validateCreateForm = createFormAjv.compile({
         additionalProperties: false,
         required: ["kind", "config"],
         properties: {
-          kind: { enum: ["email", "webhook", "sms", "discord"] },
+          kind: { enum: ["email", "webhook", "sms", "discord", "whatsapp"] },
           config: { type: "object" },
           secret: { type: "string", maxLength: 4096 }
         }
@@ -133,11 +163,48 @@ const validateCreateForm = createFormAjv.compile({
 const schemaAjv = new Ajv2020({ allErrors: true, strict: false, validateSchema: true });
 addFormats(schemaAjv);
 
-export function buildApp(config: AppConfig, store: Store) {
+export function buildApp(config: AppConfig, store: Store, dependencies: AppDependencies = {}) {
   const app = Fastify({
     logger: config.NODE_ENV === "test" ? false : true,
-    bodyLimit: config.MAX_BODY_BYTES
+    bodyLimit: config.MAX_BODY_BYTES,
+    trustProxy: config.TRUST_PROXY as boolean | string | string[]
   });
+  const now = () => dependencies.now?.() ?? new Date();
+  const authMailer = dependencies.sendAuthEmail ?? ((message: AuthEmailMessage) => sendAuthEmail(message, config));
+  const otpKey = config.OTP_HMAC_KEY || config.DATA_ENCRYPTION_KEY;
+  const otpExpirySeconds = config.OTP_EXPIRY_SECONDS ?? 300;
+  const otpResendSeconds = config.OTP_RESEND_SECONDS ?? 60;
+  const otpMaxAttempts = config.OTP_MAX_ATTEMPTS ?? 5;
+  const resetTokenTtlSeconds = config.AUTH_RESET_TOKEN_TTL_SECONDS ?? 600;
+  const minimumResponseMs = config.NODE_ENV === "test" ? 0 : (config.AUTH_MIN_RESPONSE_MS ?? 150);
+
+  async function padAuthResponse(startedAt: number) {
+    const remaining = minimumResponseMs - (Date.now() - startedAt);
+    if (remaining > 0) await new Promise((resolve) => setTimeout(resolve, remaining));
+  }
+
+  function authRateKey(kind: string, value: string): string {
+    return `${kind}:${hashIp(value, config.DATA_ENCRYPTION_KEY)}`;
+  }
+
+  async function enforceAuthRate(kind: string, value: string, windowSeconds: number, max: number, reply: FastifyReply) {
+    const result = await store.checkAuthRateLimit(authRateKey(kind, value), windowSeconds, max, now());
+    if (result.allowed) return null;
+    reply.header("Retry-After", result.retryAfterSeconds);
+    return problem(reply, 429, "Too many requests", "Please wait before trying again.", {
+      code: "RATE_LIMITED", retryAfterSeconds: result.retryAfterSeconds
+    });
+  }
+
+  async function sendChallengeEmail(message: AuthEmailMessage) {
+    try {
+      await authMailer(message);
+    } catch {
+      // Never include codes or provider responses in logs.
+      app.log.warn({ event: "authentication_email_failed" }, "Authentication email delivery failed");
+    }
+  }
+
   const limiter = new FixedWindowRateLimiter(config.RATE_LIMIT_WINDOW_SECONDS * 1000, config.RATE_LIMIT_MAX);
   const signupLimiter = new FixedWindowRateLimiter(60 * 60 * 1000, 5);
   const authTrafficLimiter = new FixedWindowRateLimiter(15 * 60 * 1000, 300);
@@ -192,6 +259,43 @@ export function buildApp(config: AppConfig, store: Store) {
     return reply.code(204).send();
   });
 
+  // Website enquiries are independent of tenant forms and their delivery queues.
+  app.post("/v1/site-contact", async (request, reply) => {
+    if (!sameOrigin(request)) return problem(reply, 403, "Forbidden", "Use the website contact page.");
+    const rate = limiter.check(`site-contact:${request.ip}`);
+    if (!rate.allowed) { reply.header("Retry-After", rate.retryAfterSeconds); return problem(reply, 429, "Rate limit exceeded", "Please wait before sending another message."); }
+    const parsed = z.object({
+      name: z.string().trim().min(1).max(100), email: z.string().trim().email().max(254),
+      message: z.string().trim().min(10).max(5000), _website: z.string().max(500).optional()
+    }).strict().safeParse(request.body);
+    if (!parsed.success) return problem(reply, 422, "Invalid message", "Check your name, email, and message.");
+    const key = firstHeader(request.headers["idempotency-key"]);
+    if (!key || !isValidIdempotencyKey(key)) return problem(reply, 422, "Invalid request", "A valid idempotency key is required.");
+    if (!parsed.data._website) await store.saveSiteContact(parsed.data, key);
+    return reply.code(202).send({ message: "Your message was received." });
+  });
+
+  app.get("/v1/admin/site-contact", async (request, reply) => {
+    const actor = await adminFor(request);
+    if (!actor) return problem(reply, 401, "Unauthorized", "Sign in to continue.");
+    if (actor.role === "tenant") return problem(reply, 403, "Forbidden", "Only service administrators can read website messages.");
+    const query = z.object({ page: z.coerce.number().int().min(1).max(100000).default(1), limit: z.coerce.number().int().min(1).max(100).default(20) }).safeParse(request.query);
+    if (!query.success) return problem(reply, 422, "Invalid request", "Invalid page or limit.");
+    const { page, limit } = query.data;
+    const result = await store.listSiteContacts(page, limit);
+    return { messages: result.messages, pagination: { page, limit, total: result.total, pages: Math.ceil(result.total / limit) } };
+  });
+
+  app.delete<{ Params: { id: string } }>("/v1/admin/site-contact/:id", async (request, reply) => {
+    const actor = await adminFor(request);
+    if (!actor) return problem(reply, 401, "Unauthorized", "Sign in to continue.");
+    if (actor.role === "tenant") return problem(reply, 403, "Forbidden", "Only service administrators can delete website messages.");
+    if (!sameOrigin(request)) return problem(reply, 403, "Forbidden", "Invalid request origin.");
+    if (!z.string().uuid().safeParse(request.params.id).success) return problem(reply, 422, "Invalid request", "Invalid message ID.");
+    if (!await store.deleteSiteContact(request.params.id)) return problem(reply, 404, "Not found", "Message not found.");
+    return { deleted: true };
+  });
+
   app.get("/health/live", async () => ({ status: "ok" }));
 
   app.get("/", async () => ({
@@ -240,30 +344,233 @@ export function buildApp(config: AppConfig, store: Store) {
   });
 
   app.post("/v1/auth/signup", async (request, reply) => {
+    const startedAt = Date.now();
     if (!sameOrigin(request)) return problem(reply, 403, "Forbidden", "Use the hosted signup page.");
-    const limit = authTrafficLimiter.check(request.ip);
-    if (!limit.allowed) return problem(reply, 429, "Too many attempts", "Try again later.");
-    if (!assertPlainObject(request.body) || Object.keys(request.body).some((key) => !["workspaceName", "email", "password"].includes(key)) || typeof request.body.workspaceName !== "string" ||
-      typeof request.body.email !== "string" || typeof request.body.password !== "string") {
-      return problem(reply, 400, "Invalid request", "Workspace name, email, and password are required.");
+    const parsed = z.object({
+      workspaceName: z.string().trim().min(1).max(200),
+      email: z.string().trim().email().max(254),
+      password: z.string().min(8).max(256),
+      phone: z.string().trim().max(32).optional().or(z.literal(""))
+    }).strict().safeParse(request.body);
+    if (!parsed.success) return problem(reply, 422, "Invalid request", "Use a valid workspace, email, and password of at least 8 characters.");
+    const workspaceName = tenantSlug(parsed.data.workspaceName);
+    const email = normalizeEmail(parsed.data.email);
+    const phone = parsed.data.phone?.trim() || null;
+    if (!workspaceName || workspaceName.length > 200 || parsed.data.workspaceName.length > 200) {
+      return problem(reply, 422, "Invalid request", "Use a workspace name that produces a valid workspace.");
     }
-    const workspaceName = tenantSlug(request.body.workspaceName);
-    const email = request.body.email.trim().toLowerCase();
-    const password = request.body.password;
-    if (!workspaceName || workspaceName.length > 200 || request.body.workspaceName.length > 200 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ||
-      email.length > 254 || password.length < 8 || password.length > 256) {
-      return problem(reply, 422, "Invalid request", "Use a valid workspace, email, and password of at least 8 characters.");
+    if (phone && !/^\+[1-9]\d{7,14}$/.test(phone)) return problem(reply, 422, "Invalid request", "Use an international phone number, or leave it blank.");
+
+    const limited = await enforceAuthRate("signup:ip", request.ip, 15 * 60, 5, reply);
+    if (limited) return limited;
+    const deliveryLimited = await enforceAuthRate("otp:deliver", email, 60 * 60, 5, reply);
+    if (deliveryLimited) return deliveryLimited;
+
+    const challengeId = randomUUID();
+    const code = generateOtp();
+    const createdAt = now();
+    const result = await store.startSignupChallenge({
+      challengeId,
+      workspaceName,
+      email,
+      passwordHash: await hashPassword(parsed.data.password),
+      phone,
+      otpHash: hashOtp(otpKey, "signup", email, challengeId, code),
+      expiresAt: new Date(createdAt.getTime() + otpExpirySeconds * 1000),
+      resendAvailableAt: new Date(createdAt.getTime() + otpResendSeconds * 1000),
+      maxAttempts: otpMaxAttempts,
+      now: createdAt
+    });
+    if (result.shouldSend) {
+      await sendChallengeEmail({ kind: "signup_code", to: email, code, expiresMinutes: Math.ceil(otpExpirySeconds / 60) });
     }
-    if (!signupLimiter.check(request.ip).allowed) return problem(reply, 429, "Too many attempts", "Try again later.");
-    try {
-      await store.createSiteAccount(workspaceName, email, await hashPassword(password));
-      return reply.code(202).send({ message: "If this address can be registered, workspace setup will continue." });
-    } catch (error) {
-      if (typeof error === "object" && error !== null && "code" in error && error.code === "23505") {
-        return reply.code(202).send({ message: "If this address can be registered, workspace setup will continue." });
-      }
-      throw error;
+    await padAuthResponse(startedAt);
+    return reply.code(202).send({
+      message: GENERIC_AUTH_MESSAGE,
+      challengeId: result.challengeId,
+      expiresInSeconds: secondsUntil(result.expiresAt, createdAt),
+      resendAfterSeconds: secondsUntil(result.resendAvailableAt, createdAt)
+    });
+  });
+
+  app.post("/v1/auth/signup/verify", async (request, reply) => {
+    if (!sameOrigin(request)) return problem(reply, 403, "Forbidden", "Use the hosted signup page.");
+    const parsed = z.object({ challengeId: z.string().uuid(), code: z.string() }).strict().safeParse(request.body);
+    if (!parsed.success || !isSixDigitCode(parsed.data.code)) return problem(reply, 422, "Invalid request", "Enter the six-digit verification code.");
+    const limited = await enforceAuthRate("otp:verify:ip", request.ip, 15 * 60, 30, reply);
+    if (limited) return limited;
+    const challenge = await store.getAuthChallenge(parsed.data.challengeId);
+    if (!challenge || challenge.purpose !== "signup") return challengeStatusProblem(reply, { status: "invalid", attemptsRemaining: 0 });
+    const result = await store.verifySignupChallenge({
+      challengeId: parsed.data.challengeId,
+      otpHash: hashOtp(otpKey, "signup", challenge.email, parsed.data.challengeId, parsed.data.code),
+      now: now()
+    });
+    if (result.status !== "ok") return challengeStatusProblem(reply, result);
+    return { message: "Your email is verified and your workspace is ready. Sign in to continue." };
+  });
+
+  app.post("/v1/auth/signup/resend", async (request, reply) => {
+    const startedAt = Date.now();
+    if (!sameOrigin(request)) return problem(reply, 403, "Forbidden", "Use the hosted signup page.");
+    const parsed = z.object({ challengeId: z.string().uuid() }).strict().safeParse(request.body);
+    if (!parsed.success) return problem(reply, 422, "Invalid request", "A valid verification challenge is required.");
+    const challenge = await store.getAuthChallenge(parsed.data.challengeId);
+    if (!challenge || challenge.purpose !== "signup") return problem(reply, 400, "Invalid request", "This verification request is no longer valid.");
+    const deliveryLimited = await enforceAuthRate("otp:deliver", challenge.email, 60 * 60, 5, reply);
+    if (deliveryLimited) return deliveryLimited;
+    const createdAt = now();
+    const code = generateOtp();
+    const result = await store.rotateAuthChallenge({
+      challengeId: challenge.id,
+      otpHash: hashOtp(otpKey, "signup", challenge.email, challenge.id, code),
+      expiresAt: new Date(createdAt.getTime() + otpExpirySeconds * 1000),
+      resendAvailableAt: new Date(createdAt.getTime() + otpResendSeconds * 1000),
+      now: createdAt
+    });
+    if (result.status === "cooldown" || result.status === "locked") {
+      const retryAfter = result.retryAfterSeconds ?? otpResendSeconds;
+      reply.header("Retry-After", retryAfter);
+      return problem(reply, 429, "Too many requests", "Please wait before requesting another code.", { code: "RESEND_COOLDOWN", retryAfterSeconds: retryAfter });
     }
+    if (result.status !== "ok" || !result.expiresAt || !result.resendAvailableAt) {
+      return problem(reply, 400, "Invalid request", "This verification request is no longer valid.");
+    }
+    if (result.shouldSend) {
+      await sendChallengeEmail({ kind: "signup_code", to: challenge.email, code, expiresMinutes: Math.ceil(otpExpirySeconds / 60) });
+    }
+    await padAuthResponse(startedAt);
+    return reply.code(202).send({
+      message: GENERIC_AUTH_MESSAGE,
+      challengeId: challenge.id,
+      expiresInSeconds: secondsUntil(result.expiresAt, createdAt),
+      resendAfterSeconds: secondsUntil(result.resendAvailableAt, createdAt)
+    });
+  });
+
+  app.post("/v1/auth/forgot-password", async (request, reply) => {
+    const startedAt = Date.now();
+    if (!sameOrigin(request)) return problem(reply, 403, "Forbidden", "Use the hosted signup page.");
+    const parsed = z.object({ email: z.string().trim().email().max(254) }).strict().safeParse(request.body);
+    if (!parsed.success) return problem(reply, 422, "Invalid request", "Enter a valid email address.");
+    const email = normalizeEmail(parsed.data.email);
+    const limited = await enforceAuthRate("forgot:ip", request.ip, 15 * 60, 5, reply);
+    if (limited) return limited;
+    const accountLimited = await enforceAuthRate("forgot:account", email, 60 * 60, 3, reply);
+    if (accountLimited) return accountLimited;
+    const deliveryLimited = await enforceAuthRate("otp:deliver", email, 60 * 60, 5, reply);
+    if (deliveryLimited) return deliveryLimited;
+
+    const challengeId = randomUUID();
+    const code = generateOtp();
+    const createdAt = now();
+    const result = await store.startPasswordResetChallenge({
+      challengeId,
+      email,
+      otpHash: hashOtp(otpKey, "password_reset", email, challengeId, code),
+      expiresAt: new Date(createdAt.getTime() + otpExpirySeconds * 1000),
+      resendAvailableAt: new Date(createdAt.getTime() + otpResendSeconds * 1000),
+      maxAttempts: otpMaxAttempts,
+      now: createdAt
+    });
+    if (result.shouldSend) {
+      await sendChallengeEmail({ kind: "password_reset_code", to: email, code, expiresMinutes: Math.ceil(otpExpirySeconds / 60) });
+    }
+    await padAuthResponse(startedAt);
+    return reply.code(202).send({
+      message: GENERIC_AUTH_MESSAGE,
+      challengeId: result.challengeId,
+      expiresInSeconds: secondsUntil(result.expiresAt, createdAt),
+      resendAfterSeconds: secondsUntil(result.resendAvailableAt, createdAt)
+    });
+  });
+
+  app.post("/v1/auth/forgot-password/verify", async (request, reply) => {
+    if (!sameOrigin(request)) return problem(reply, 403, "Forbidden", "Use the hosted signup page.");
+    const parsed = z.object({ challengeId: z.string().uuid(), code: z.string() }).strict().safeParse(request.body);
+    if (!parsed.success || !isSixDigitCode(parsed.data.code)) return problem(reply, 422, "Invalid request", "Enter the six-digit verification code.");
+    const limited = await enforceAuthRate("otp:verify:ip", request.ip, 15 * 60, 30, reply);
+    if (limited) return limited;
+    const challenge = await store.getAuthChallenge(parsed.data.challengeId);
+    if (!challenge || challenge.purpose !== "password_reset") return challengeStatusProblem(reply, { status: "invalid", attemptsRemaining: 0 });
+    const resetToken = newResetToken();
+    const createdAt = now();
+    const result = await store.verifyPasswordResetChallenge({
+      challengeId: parsed.data.challengeId,
+      otpHash: hashOtp(otpKey, "password_reset", challenge.email, parsed.data.challengeId, parsed.data.code),
+      resetTokenHash: hashResetToken(resetToken),
+      resetTokenExpiresAt: new Date(createdAt.getTime() + resetTokenTtlSeconds * 1000),
+      now: createdAt
+    });
+    if (result.status !== "ok") return challengeStatusProblem(reply, result);
+    return {
+      message: "Email verified. Choose a new password.",
+      token: resetToken,
+      resetToken,
+      expiresInSeconds: resetTokenTtlSeconds
+    };
+  });
+
+  app.post("/v1/auth/forgot-password/resend", async (request, reply) => {
+    const startedAt = Date.now();
+    if (!sameOrigin(request)) return problem(reply, 403, "Forbidden", "Use the hosted signup page.");
+    const parsed = z.object({ challengeId: z.string().uuid() }).strict().safeParse(request.body);
+    if (!parsed.success) return problem(reply, 422, "Invalid request", "A valid verification challenge is required.");
+    const challenge = await store.getAuthChallenge(parsed.data.challengeId);
+    if (!challenge || challenge.purpose !== "password_reset") return problem(reply, 400, "Invalid request", "This verification request is no longer valid.");
+    const deliveryLimited = await enforceAuthRate("otp:deliver", challenge.email, 60 * 60, 5, reply);
+    if (deliveryLimited) return deliveryLimited;
+    const createdAt = now();
+    const code = generateOtp();
+    const result = await store.rotateAuthChallenge({
+      challengeId: challenge.id,
+      otpHash: hashOtp(otpKey, "password_reset", challenge.email, challenge.id, code),
+      expiresAt: new Date(createdAt.getTime() + otpExpirySeconds * 1000),
+      resendAvailableAt: new Date(createdAt.getTime() + otpResendSeconds * 1000),
+      now: createdAt
+    });
+    if (result.status === "cooldown" || result.status === "locked") {
+      const retryAfter = result.retryAfterSeconds ?? otpResendSeconds;
+      reply.header("Retry-After", retryAfter);
+      return problem(reply, 429, "Too many requests", "Please wait before requesting another code.", { code: "RESEND_COOLDOWN", retryAfterSeconds: retryAfter });
+    }
+    if (result.status !== "ok" || !result.expiresAt || !result.resendAvailableAt) {
+      return problem(reply, 400, "Invalid request", "This verification request is no longer valid.");
+    }
+    if (result.shouldSend) {
+      await sendChallengeEmail({ kind: "password_reset_code", to: challenge.email, code, expiresMinutes: Math.ceil(otpExpirySeconds / 60) });
+    }
+    await padAuthResponse(startedAt);
+    return reply.code(202).send({
+      message: GENERIC_AUTH_MESSAGE,
+      challengeId: challenge.id,
+      expiresInSeconds: secondsUntil(result.expiresAt, createdAt),
+      resendAfterSeconds: secondsUntil(result.resendAvailableAt, createdAt)
+    });
+  });
+
+  app.post("/v1/auth/reset-password", async (request, reply) => {
+    if (!sameOrigin(request)) return problem(reply, 403, "Forbidden", "Use the hosted signup page.");
+    const parsed = z.object({
+      token: z.string().min(20).max(256),
+      password: z.string().min(8).max(256).optional(),
+      newPassword: z.string().min(8).max(256).optional(),
+      confirmPassword: z.string().max(256).optional()
+    }).strict().safeParse(request.body);
+    const password = parsed.success ? parsed.data.password ?? parsed.data.newPassword : undefined;
+    if (!parsed.success || !password || (parsed.data.confirmPassword !== undefined && parsed.data.confirmPassword !== password)) {
+      return problem(reply, 422, "Invalid request", "Use a new password of 8–256 characters and make sure both entries match.");
+    }
+    const limited = await enforceAuthRate("password:reset:ip", request.ip, 15 * 60, 10, reply);
+    if (limited) return limited;
+    const changed = await store.resetPasswordWithToken({
+      tokenHash: hashResetToken(parsed.data.token),
+      passwordHash: await hashPassword(password),
+      now: now()
+    });
+    if (!changed) return problem(reply, 400, "Invalid request", "This password reset link is invalid or has expired.", { code: "RESET_TOKEN_INVALID" });
+    await sendChallengeEmail({ kind: "password_changed", to: changed.email });
+    return { message: "Your password has been reset. Sign in with your new password." };
   });
 
   app.post("/v1/admin/logout", async (request, reply) => {
@@ -463,7 +770,9 @@ export function buildApp(config: AppConfig, store: Store) {
       ? { ...(body as CreateFormInput), tenantId: admin.tenantId ?? undefined }
       : body as CreateFormInput;
     input.tenantName = tenantSlug(input.tenantName);
+    input.name = formSlug(input.name);
     if (!input.tenantId && (!input.tenantName || input.tenantName.length > 200)) return problem(reply, 422, "Invalid tenant name", "Use a workspace name that produces a non-empty slug of at most 200 characters.");
+    if (!input.name || input.name.length > 200) return problem(reply, 422, "Invalid form name", "Use a form name that produces a non-empty slug of at most 200 characters.");
     for (const origin of input.allowedOrigins) {
       if (!isAllowedOrigin(origin, [origin])) {
         return problem(reply, 422, "Validation failed", "Allowed origins must be exact HTTP or HTTPS origins.");
@@ -489,13 +798,21 @@ export function buildApp(config: AppConfig, store: Store) {
     }
 
     const publicKey = newPublicKey();
-    const form = await store.createForm(input, publicKey);
-    return reply.code(201).send({
-      id: form.id,
-      tenantId: form.tenantId,
-      publicKey: form.publicKey,
-      submitUrl: `${config.PUBLIC_BASE_URL}/v1/forms/${form.publicKey}/submissions`
-    });
+    try {
+      const form = await store.createForm(input, publicKey);
+      return reply.code(201).send({
+        id: form.id,
+        tenantId: form.tenantId,
+        publicKey: form.publicKey,
+        name: form.name,
+        submitUrl: `${config.PUBLIC_BASE_URL}/v1/forms/${form.publicKey}/submissions`
+      });
+    } catch (error) {
+      if (typeof error === "object" && error !== null && "code" in error && error.code === "23505") {
+        return problem(reply, 409, "Conflict", "This workspace already has a form with that name.");
+      }
+      throw error;
+    }
   });
 
   app.get<{ Params: { publicKey: string } }>("/v1/forms/:publicKey", async (request, reply) => {
@@ -549,8 +866,10 @@ export function buildApp(config: AppConfig, store: Store) {
       changes.status = request.body.status as "active" | "disabled";
     }
     if (request.body.name !== undefined) {
-      if (typeof request.body.name !== "string" || !request.body.name.trim() || request.body.name.length > 200) return problem(reply, 422, "Invalid request", "A valid form name is required.");
-      changes.name = request.body.name.trim();
+      if (typeof request.body.name !== "string" || request.body.name.length > 200) return problem(reply, 422, "Invalid request", "A valid form name is required.");
+      const name = formSlug(request.body.name);
+      if (!name || name.length > 200) return problem(reply, 422, "Invalid form name", "Use a form name that produces a non-empty slug of at most 200 characters.");
+      changes.name = name;
     }
     if (request.body.successMessage !== undefined) {
       if (typeof request.body.successMessage !== "string" || !request.body.successMessage.trim() || request.body.successMessage.length > 500) return problem(reply, 422, "Invalid request", "A valid success message is required.");
@@ -579,8 +898,15 @@ export function buildApp(config: AppConfig, store: Store) {
       } catch { return problem(reply, 422, "Invalid integration", "Update your integration recipient fields and templates to match the new form fields."); }
     }
     if (!Object.keys(changes).length) return problem(reply, 422, "Invalid request", "No supported form changes were supplied.");
-    const form = await store.updateForm(request.params.publicKey, changes);
-    return { publicKey: request.params.publicKey, form };
+    try {
+      const form = await store.updateForm(request.params.publicKey, changes);
+      return { publicKey: request.params.publicKey, form };
+    } catch (error) {
+      if (typeof error === "object" && error !== null && "code" in error && error.code === "23505") {
+        return problem(reply, 409, "Conflict", "This workspace already has a form with that name.");
+      }
+      throw error;
+    }
   });
 
   app.post<{ Params: { publicKey: string } }>("/v1/admin/forms/:publicKey/test", async (request, reply) => {

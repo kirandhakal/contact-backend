@@ -1,7 +1,7 @@
 import type { JSONSchemaType } from "ajv";
 
 export type JsonObject = Record<string, unknown>;
-export type DestinationKind = "email" | "webhook" | "sms" | "discord";
+export type DestinationKind = "email" | "webhook" | "sms" | "discord" | "whatsapp";
 export type SubmissionStatus = "accepted" | "spam" | "deleted";
 export type AdminRole = "sudo" | "super" | "tenant";
 
@@ -121,7 +121,82 @@ export interface OutboxJob {
   attempts: number;
 }
 
+export interface SiteContactMessage {
+  id: string;
+  name: string;
+  email: string;
+  message: string;
+  createdAt: string;
+}
+
+
+export type AuthPurpose = "signup" | "password_reset";
+export type AuthOutcome = "ok" | "invalid" | "expired" | "locked" | "not_found" | "cooldown";
+
+export interface StartSignupChallengeInput {
+  challengeId: string;
+  workspaceName: string;
+  email: string;
+  passwordHash: string;
+  phone?: string | null;
+  otpHash: string;
+  expiresAt: Date;
+  resendAvailableAt: Date;
+  maxAttempts: number;
+  now: Date;
+}
+
+export interface StartPasswordResetChallengeInput {
+  challengeId: string;
+  email: string;
+  otpHash: string;
+  expiresAt: Date;
+  resendAvailableAt: Date;
+  maxAttempts: number;
+  now: Date;
+}
+
+export interface AuthChallenge {
+  id: string;
+  purpose: AuthPurpose;
+  email: string;
+  pendingSignupId: string | null;
+  adminId: string | null;
+  expiresAt: Date;
+  resendAvailableAt: Date;
+  consumedAt: Date | null;
+}
+
+export interface AuthChallengeResult {
+  challengeId: string;
+  expiresAt: Date;
+  resendAvailableAt: Date;
+  shouldSend: boolean;
+  eligible: boolean;
+}
+
+export interface RotateAuthChallengeResult {
+  status: AuthOutcome;
+  email?: string;
+  expiresAt?: Date;
+  resendAvailableAt?: Date;
+  shouldSend?: boolean;
+  retryAfterSeconds?: number;
+}
+
+export interface VerifyAuthChallengeResult {
+  status: AuthOutcome;
+  attemptsRemaining: number;
+  retryAfterSeconds: number;
+  tenantId?: string;
+  email?: string;
+  adminId?: string;
+}
+
 export interface Store {
+  saveSiteContact(input: { name: string; email: string; message: string }, key: string): Promise<void>;
+  listSiteContacts(page: number, limit: number): Promise<{ messages: SiteContactMessage[]; total: number }>;
+  deleteSiteContact(id: string): Promise<boolean>;
   findReplySubmissions(publicKey: string, filters: import("./management.js").ReplyFilters): Promise<string[]>;
   queueReplies(publicKey: string, submissionIds: string[], destinationIds: string[], message: string, requestId: string, subject?: string): Promise<number>;
   deliveryStatus(publicKey: string, submissionId: string): Promise<JsonObject[]>;
@@ -131,6 +206,31 @@ export interface Store {
   analytics(tenantId?: string, from?: string, to?: string): Promise<JsonObject>;
   ready(): Promise<boolean>;
   createSiteAccount(tenantName: string, email: string, passwordHash: string): Promise<{ tenantId: string }>;
+  checkAuthRateLimit(key: string, windowSeconds: number, max: number, now: Date): Promise<{ allowed: boolean; retryAfterSeconds: number }>;
+  startSignupChallenge(input: StartSignupChallengeInput): Promise<AuthChallengeResult>;
+  startPasswordResetChallenge(input: StartPasswordResetChallengeInput): Promise<AuthChallengeResult>;
+  getAuthChallenge(challengeId: string): Promise<AuthChallenge | null>;
+  rotateAuthChallenge(input: {
+    challengeId: string;
+    otpHash: string;
+    expiresAt: Date;
+    resendAvailableAt: Date;
+    now: Date;
+  }): Promise<RotateAuthChallengeResult>;
+  verifySignupChallenge(input: { challengeId: string; otpHash: string; now: Date }): Promise<VerifyAuthChallengeResult>;
+  verifyPasswordResetChallenge(input: {
+    challengeId: string;
+    otpHash: string;
+    resetTokenHash: string;
+    resetTokenExpiresAt: Date;
+    now: Date;
+  }): Promise<VerifyAuthChallengeResult>;
+  resetPasswordWithToken(input: {
+    tokenHash: string;
+    passwordHash: string;
+    now: Date;
+  }): Promise<{ email: string; adminId: string } | null>;
+  deleteExpiredAuthData(now: Date): Promise<number>;
   createForm(input: CreateFormInput, publicKey: string): Promise<FormRecord>;
   getActiveForm(publicKey: string): Promise<FormRecord | null>;
   createSubmission(args: {

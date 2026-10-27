@@ -6,7 +6,7 @@ The backend now serves JSON at `/`; the legacy HTML auth/dashboard and JavaScrip
 
 Bootstrap sudo access with `npm run seed:admin`, setting `SEED_ADMIN_EMAIL` and `SEED_ADMIN_PASSWORD` explicitly. The password must be 12–256 characters. No default credentials are supplied; existing accounts are left unchanged.
 
-Existing `/v1/auth/signup`, `/v1/admin/login`, `/v1/admin/me`, `/v1/admin/logout`, and `/v1/admin/password` endpoints remain. Browser sessions use HTTP-only cookies with an eight-hour lifetime. `POST /v1/admin/password` requires `currentPassword` and `newPassword` (12–256 characters); success revokes all of that account's sessions.
+Tenant signup is email-verified: `POST /v1/auth/signup` creates a pending signup, `/v1/auth/signup/verify` activates it, and `/v1/auth/signup/resend` rotates the code. Password reset uses `/v1/auth/forgot-password`, its `/verify` and `/resend` endpoints, then `/v1/auth/reset-password`. Unknown or ineligible emails receive generic responses. `/v1/admin/login`, `/v1/admin/me`, `/v1/admin/logout`, and `/v1/admin/password` remain. Browser sessions use HTTP-only cookies with an eight-hour lifetime. `POST /v1/admin/password` requires `currentPassword` and `newPassword` (12–256 characters); success revokes all of that account's sessions.
 
 The Next.js frontend uses a same-origin proxy and translates the session cookie path to `/`. Direct cookie-authenticated mutations must supply an Origin matching `PUBLIC_BASE_URL`. Service automation can use `Authorization: Bearer ADMIN_API_KEY` on supported admin endpoints. Never expose that key in a browser.
 
