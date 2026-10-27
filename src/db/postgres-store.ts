@@ -1,7 +1,7 @@
 import { publicDeliveryError } from "../delivery-errors.js";
 import pg from "pg";
 import { encryptDestination, decryptDestination } from "../integrations.js";
-import { tenantSlug } from "../tenant-name.js";
+import { formSlug, tenantSlug } from "../tenant-name.js";
 import type { ListQuery, PageResult } from "../management.js";
 import { payloadConditions, type ReplyFilters } from "../management.js";
 import { z } from "zod";
@@ -132,6 +132,8 @@ export class PostgresStore implements Store {
   }
 
   async createForm(input: CreateFormInput, publicKey: string): Promise<FormRecord> {
+    const name = formSlug(input.name);
+    if (!name || name.length > 200) throw Object.assign(new Error("Invalid form name"), { code: "22P02" });
     const client = await this.pool.connect();
     try {
       await client.query("begin");
@@ -146,7 +148,7 @@ export class PostgresStore implements Store {
         [
           tenant.rows[0].id,
           publicKey,
-          input.name,
+          name,
           input.allowedOrigins,
           input.successMessage ?? "Thank you. We received your message.",
           input.honeypotField ?? "_website"
@@ -203,6 +205,8 @@ export class PostgresStore implements Store {
   }
 
   async updateForm(publicKey: string, input: Partial<Pick<CreateFormInput, "name" | "allowedOrigins" | "successMessage" | "schema" | "destinations">> & { status?: "active" | "disabled" }): Promise<FormRecord | null> {
+    const name = input.name === undefined ? null : formSlug(input.name);
+    if (input.name !== undefined && (!name || name.length > 200)) throw Object.assign(new Error("Invalid form name"), { code: "22P02" });
     const client = await this.pool.connect();
     try {
       await client.query("begin");
@@ -211,7 +215,7 @@ export class PostgresStore implements Store {
           name = coalesce($2, name), allowed_origins = coalesce($3, allowed_origins),
           success_message = coalesce($4, success_message), status = coalesce($5, status)
          where public_key = $1 returning *`,
-        [publicKey, input.name ?? null, input.allowedOrigins ?? null, input.successMessage ?? null, input.status ?? null]
+        [publicKey, name, input.allowedOrigins ?? null, input.successMessage ?? null, input.status ?? null]
       );
       if (!updated.rowCount) { await client.query("rollback"); return null; }
       if (input.destinations !== undefined) {

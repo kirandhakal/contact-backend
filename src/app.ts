@@ -1,5 +1,5 @@
 import { validateDestinations } from "./integrations.js";
-import { tenantSlug } from "./tenant-name.js";
+import { formSlug, tenantSlug } from "./tenant-name.js";
 import { checkLogin } from "./login-lockout.js";
 import { createRequire } from "node:module";
 import { z } from "zod";
@@ -500,7 +500,9 @@ export function buildApp(config: AppConfig, store: Store) {
       ? { ...(body as CreateFormInput), tenantId: admin.tenantId ?? undefined }
       : body as CreateFormInput;
     input.tenantName = tenantSlug(input.tenantName);
+    input.name = formSlug(input.name);
     if (!input.tenantId && (!input.tenantName || input.tenantName.length > 200)) return problem(reply, 422, "Invalid tenant name", "Use a workspace name that produces a non-empty slug of at most 200 characters.");
+    if (!input.name || input.name.length > 200) return problem(reply, 422, "Invalid form name", "Use a form name that produces a non-empty slug of at most 200 characters.");
     for (const origin of input.allowedOrigins) {
       if (!isAllowedOrigin(origin, [origin])) {
         return problem(reply, 422, "Validation failed", "Allowed origins must be exact HTTP or HTTPS origins.");
@@ -526,13 +528,21 @@ export function buildApp(config: AppConfig, store: Store) {
     }
 
     const publicKey = newPublicKey();
-    const form = await store.createForm(input, publicKey);
-    return reply.code(201).send({
-      id: form.id,
-      tenantId: form.tenantId,
-      publicKey: form.publicKey,
-      submitUrl: `${config.PUBLIC_BASE_URL}/v1/forms/${form.publicKey}/submissions`
-    });
+    try {
+      const form = await store.createForm(input, publicKey);
+      return reply.code(201).send({
+        id: form.id,
+        tenantId: form.tenantId,
+        publicKey: form.publicKey,
+        name: form.name,
+        submitUrl: `${config.PUBLIC_BASE_URL}/v1/forms/${form.publicKey}/submissions`
+      });
+    } catch (error) {
+      if (typeof error === "object" && error !== null && "code" in error && error.code === "23505") {
+        return problem(reply, 409, "Conflict", "This workspace already has a form with that name.");
+      }
+      throw error;
+    }
   });
 
   app.get<{ Params: { publicKey: string } }>("/v1/forms/:publicKey", async (request, reply) => {
@@ -586,8 +596,10 @@ export function buildApp(config: AppConfig, store: Store) {
       changes.status = request.body.status as "active" | "disabled";
     }
     if (request.body.name !== undefined) {
-      if (typeof request.body.name !== "string" || !request.body.name.trim() || request.body.name.length > 200) return problem(reply, 422, "Invalid request", "A valid form name is required.");
-      changes.name = request.body.name.trim();
+      if (typeof request.body.name !== "string" || request.body.name.length > 200) return problem(reply, 422, "Invalid request", "A valid form name is required.");
+      const name = formSlug(request.body.name);
+      if (!name || name.length > 200) return problem(reply, 422, "Invalid form name", "Use a form name that produces a non-empty slug of at most 200 characters.");
+      changes.name = name;
     }
     if (request.body.successMessage !== undefined) {
       if (typeof request.body.successMessage !== "string" || !request.body.successMessage.trim() || request.body.successMessage.length > 500) return problem(reply, 422, "Invalid request", "A valid success message is required.");
@@ -616,8 +628,15 @@ export function buildApp(config: AppConfig, store: Store) {
       } catch { return problem(reply, 422, "Invalid integration", "Update your integration recipient fields and templates to match the new form fields."); }
     }
     if (!Object.keys(changes).length) return problem(reply, 422, "Invalid request", "No supported form changes were supplied.");
-    const form = await store.updateForm(request.params.publicKey, changes);
-    return { publicKey: request.params.publicKey, form };
+    try {
+      const form = await store.updateForm(request.params.publicKey, changes);
+      return { publicKey: request.params.publicKey, form };
+    } catch (error) {
+      if (typeof error === "object" && error !== null && "code" in error && error.code === "23505") {
+        return problem(reply, 409, "Conflict", "This workspace already has a form with that name.");
+      }
+      throw error;
+    }
   });
 
   app.post<{ Params: { publicKey: string } }>("/v1/admin/forms/:publicKey/test", async (request, reply) => {

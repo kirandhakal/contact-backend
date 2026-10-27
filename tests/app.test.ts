@@ -123,7 +123,12 @@ class MemoryStore implements Store {
   async getForm(publicKey: string) { return this.forms.get(publicKey) ?? null; }
   async updateForm(publicKey: string, input: Partial<CreateFormInput> & { status?: "active" | "disabled" }) {
     const form = this.forms.get(publicKey); if (!form) return null;
-    if (input.name) form.name = input.name;
+    if (input.name) {
+      if ([...this.forms.entries()].some(([key, other]) => key !== publicKey && other.tenantId === form.tenantId && other.name === input.name)) {
+        throw Object.assign(new Error("duplicate form name"), { code: "23505" });
+      }
+      form.name = input.name;
+    }
     if (input.allowedOrigins) form.allowedOrigins = input.allowedOrigins;
     if (input.successMessage) form.successMessage = input.successMessage;
     if (input.schema) { form.schema = input.schema as JsonObject; form.version += 1; }
@@ -154,6 +159,9 @@ class MemoryStore implements Store {
 
   async createForm(input: CreateFormInput, publicKey: string): Promise<FormRecord> {
     const tenantId = input.tenantId ?? await this.createTenant(input.tenantName);
+    if ([...this.forms.values()].some((form) => form.tenantId === tenantId && form.name === input.name)) {
+      throw Object.assign(new Error("duplicate form name"), { code: "23505" });
+    }
     const form: FormRecord = {
       id: randomUUID(),
       tenantId,
@@ -288,7 +296,7 @@ async function createTestForm(store: MemoryStore) {
     }
   });
   expect(response.statusCode).toBe(201);
-  return { app, body: response.json() as { publicKey: string } };
+  return { app, body: response.json() as { publicKey: string; tenantId: string; name: string } };
 }
 
 describe("contact form API", () => {
@@ -392,7 +400,7 @@ describe("contact form API", () => {
       successMessage: "Updated", schema: { type: "object", additionalProperties: false, properties: { email: { type: "string", format: "email" } } }
     } });
     expect(edited.statusCode).toBe(200);
-    expect(store.forms.get(publicKey)).toEqual(expect.objectContaining({ name: "Edited", version: 2,
+    expect(store.forms.get(publicKey)).toEqual(expect.objectContaining({ name: "edited", version: 2,
       allowedOrigins: ["https://one.example", "https://two.example"] }));
     const overLimit = await app.inject({ method: "POST", url: "/v1/admin/forms", headers, payload: {
       tenantName: "Ignored", name: "Second", allowedOrigins: ["https://one.example"],
@@ -647,6 +655,27 @@ describe("contact form API", () => {
   it("creates a form through the admin endpoint", async () => {
     const { body } = await createTestForm(new MemoryStore());
     expect(body.publicKey).toMatch(/^frm_/);
+    expect(body.name).toBe("website-contact");
+  });
+
+  it("rejects duplicate form names within the same tenant", async () => {
+    const store = new MemoryStore();
+    const { app, body } = await createTestForm(store);
+    const headers = { authorization: `Bearer ${config.ADMIN_API_KEY}`, origin: config.PUBLIC_BASE_URL };
+    const duplicate = await app.inject({
+      method: "POST",
+      url: "/v1/admin/forms",
+      headers,
+      payload: {
+        tenantId: body.tenantId,
+        tenantName: "Ignored",
+        name: "Website Contact",
+        allowedOrigins: ["https://www.example.com"],
+        schema: { type: "object", additionalProperties: false, properties: { name: { type: "string" } } }
+      }
+    });
+    expect(duplicate.statusCode).toBe(409);
+    await app.close();
   });
 
   it("accepts valid submissions and rejects disallowed origins", async () => {
