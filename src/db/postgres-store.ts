@@ -138,15 +138,16 @@ export class PostgresStore implements Store {
     }
   }
   async checkAuthRateLimit(key: string, windowSeconds: number, max: number, now: Date) {
+    const expiresAt = new Date(now.getTime() + windowSeconds * 1000);
     const result = await this.pool.query(
       `insert into auth_rate_limits(key, window_started_at, count, expires_at)
-       values($1, $4, 1, $4 + ($3 * interval '1 second'))
+       values($1, $2, 1, $3)
        on conflict (key) do update set
-         count = case when auth_rate_limits.expires_at <= $4 then 1 else auth_rate_limits.count + 1 end,
-         window_started_at = case when auth_rate_limits.expires_at <= $4 then $4 else auth_rate_limits.window_started_at end,
-         expires_at = case when auth_rate_limits.expires_at <= $4 then $4 + ($3 * interval '1 second') else auth_rate_limits.expires_at end
+         count = case when auth_rate_limits.expires_at <= $2 then 1 else auth_rate_limits.count + 1 end,
+         window_started_at = case when auth_rate_limits.expires_at <= $2 then $2 else auth_rate_limits.window_started_at end,
+         expires_at = case when auth_rate_limits.expires_at <= $2 then $3 else auth_rate_limits.expires_at end
        returning count, expires_at`,
-      [key, windowSeconds, windowSeconds, now]
+      [key, now, expiresAt]
     );
     const row = result.rows[0];
     const allowed = Number(row.count) <= max;
@@ -195,13 +196,11 @@ export class PostgresStore implements Store {
           [input.email, input.workspaceName, input.passwordHash, input.phone ?? null, new Date(input.now.getTime() + 24 * 60 * 60 * 1000)]
         );
         pendingId = inserted.rows[0].id;
-      } else if (new Date(pending.rows[0].expires_at) <= input.now) {
+      } else {
         await client.query(
           "update pending_signups set workspace_name=$2,password_hash=$3,phone=$4,expires_at=$5,created_at=$6 where id=$1",
           [pending.rows[0].id, input.workspaceName, input.passwordHash, input.phone ?? null, new Date(input.now.getTime() + 24 * 60 * 60 * 1000), input.now]
         );
-        pendingId = pending.rows[0].id;
-      } else {
         pendingId = pending.rows[0].id;
       }
 

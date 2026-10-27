@@ -126,9 +126,13 @@ class MemoryStore implements Store {
       return { challengeId: challenge.id, expiresAt: challenge.expiresAt, resendAvailableAt: challenge.resendAvailableAt, shouldSend: false, eligible: false };
     }
     const existingPending = this.pendingSignups.get(input.email);
-    const pending = !existingPending || existingPending.expiresAt <= input.now
-      ? { id: randomUUID(), workspaceName: input.workspaceName, passwordHash: input.passwordHash, phone: input.phone ?? null, expiresAt: new Date(input.now.getTime() + 24 * 60 * 60 * 1000) }
-      : existingPending;
+    const pending = {
+      id: existingPending?.id ?? randomUUID(),
+      workspaceName: input.workspaceName,
+      passwordHash: input.passwordHash,
+      phone: input.phone ?? null,
+      expiresAt: new Date(input.now.getTime() + 24 * 60 * 60 * 1000)
+    };
     this.pendingSignups.set(input.email, pending);
     challenge.pendingSignupId = pending.id;
     this.authChallenges.set(challenge.id, challenge);
@@ -1120,6 +1124,28 @@ describe("email-verified auth", () => {
       payload: { challengeId: other.json().challengeId, code: latestCode(store, "expired@studio.test", "signup_code") } });
     expect(expired.statusCode).toBe(400);
     expect(expired.json().code).toBe("OTP_EXPIRED");
+    await app.close();
+  });
+
+  it("uses the latest signup details when a pending request is restarted", async () => {
+    let clock = new Date("2026-01-01T00:00:00Z");
+    const store = new MemoryStore(); const app = makeApp(store, config, () => clock);
+    const first = await app.inject({ method: "POST", url: "/v1/auth/signup", headers: { origin: config.PUBLIC_BASE_URL },
+      payload: { workspaceName: "First Studio", email: "restart@studio.test", password: "first-password" } });
+    expect(first.statusCode).toBe(202);
+    clock = new Date(clock.getTime() + 61_000);
+    const second = await app.inject({ method: "POST", url: "/v1/auth/signup", headers: { origin: config.PUBLIC_BASE_URL },
+      payload: { workspaceName: "Second Studio", email: "restart@studio.test", password: "second-password" } });
+    expect(second.statusCode).toBe(202);
+    expect(second.json().challengeId).not.toBe(first.json().challengeId);
+    const verify = await app.inject({ method: "POST", url: "/v1/auth/signup/verify", headers: { origin: config.PUBLIC_BASE_URL },
+      payload: { challengeId: second.json().challengeId, code: latestCode(store, "restart@studio.test", "signup_code") } });
+    expect(verify.statusCode).toBe(200);
+    expect((await app.inject({ method: "POST", url: "/v1/admin/login", headers: { origin: config.PUBLIC_BASE_URL }, payload: { email: "restart@studio.test", password: "first-password" } })).statusCode).toBe(401);
+    const login = await app.inject({ method: "POST", url: "/v1/admin/login", headers: { origin: config.PUBLIC_BASE_URL }, payload: { email: "restart@studio.test", password: "second-password" } });
+    expect(login.statusCode).toBe(200);
+    const tenantId = (await store.getAdminByEmail("restart@studio.test"))?.tenantId;
+    expect(store.tenants.get(tenantId!)?.name).toBe("second-studio");
     await app.close();
   });
 

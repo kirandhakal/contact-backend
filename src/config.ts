@@ -16,7 +16,7 @@ const EnvSchema = z.object({
   DATABASE_URL: z.string().default("postgres://forms:forms@localhost:5432/forms"),
   ADMIN_API_KEY: z.string().min(24),
   DATA_ENCRYPTION_KEY: z.string().regex(/^[a-fA-F0-9]{64}$/),
-  OTP_HMAC_KEY: z.string().regex(/^[a-fA-F0-9]{64}$/).optional(),
+  OTP_HMAC_KEY: z.preprocess((value) => value === "" ? undefined : value, z.string().regex(/^[a-fA-F0-9]{64}$/).optional()),
   OTP_EXPIRY_SECONDS: z.coerce.number().int().positive().default(300),
   OTP_RESEND_SECONDS: z.coerce.number().int().positive().default(60),
   OTP_MAX_ATTEMPTS: z.coerce.number().int().positive().default(5),

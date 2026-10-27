@@ -18,7 +18,7 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)("PostgreSQL management integrati
     const url = new URL(process.env.TEST_DATABASE_URL!);
     const setup = new pg.Client({ connectionString: url.toString() }); await setup.connect();
     await setup.query(`create schema ${schema}`); await setup.end();
-    url.searchParams.set("options", `-c search_path=${schema},public`);
+    url.searchParams.set("options", `-c search_path=${schema}`);
     pool = new pg.Pool({ connectionString: url.toString() }); store = new PostgresStore(url.toString(), "b".repeat(64));
     for (let pass = 0; pass < 2; pass++) for (const file of (await readdir(new URL("../migrations/", import.meta.url))).filter(f => f.endsWith(".sql")).sort()) await pool.query(await readFile(new URL(`../migrations/${file}`, import.meta.url), "utf8"));
     tenantId = (await store.createSiteAccount("SQL studio", `${schema}@example.com`, await hashPassword("original-password"))).tenantId;
@@ -49,7 +49,7 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)("PostgreSQL management integrati
     const email = `${randomUUID()}@example.com`;
     const credentials = { email, password: "signup-test-password", portal: "tenant" };
     try {
-      await pool.query("DROP TABLE login_lockouts");
+      await pool.query(`DROP TABLE ${schema}.login_lockouts`);
       const signup = await app.inject({ method: "POST", url: "/v1/auth/signup", headers, payload: { workspaceName: "Café & Company", email, password: credentials.password } });
       expect(signup.statusCode).toBe(202);
       const code = messages.find(message => message.to === email && message.kind === "signup_code");
