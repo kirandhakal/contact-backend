@@ -55,7 +55,7 @@ export function isSafeWebhookUrl(value: unknown): value is string {
   if (typeof value !== "string") return false;
   try {
     const url = new URL(value);
-    if (url.protocol !== "https:") return false;
+    if (url.protocol !== "https:" || url.username || url.password || (url.port && url.port !== "443")) return false;
     const host = url.hostname.toLowerCase();
     if (host === "localhost" || host.endsWith(".localhost")) return false;
     if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) return false;

@@ -1,5 +1,11 @@
+import { publicDeliveryError } from "../delivery-errors.js";
+import { otpMatches } from "../auth-otp.js";
 import pg from "pg";
+import { encryptDestination, decryptDestination } from "../integrations.js";
+import { formSlug, tenantSlug } from "../tenant-name.js";
 import type { ListQuery, PageResult } from "../management.js";
+import { payloadConditions, type ReplyFilters } from "../management.js";
+import { z } from "zod";
 import type {
   CreateFormInput,
   AdminRole,
@@ -14,7 +20,13 @@ import type {
   SubmissionStatus,
   TenantLimits,
   TenantSummary,
-  TenantUsage
+  TenantUsage,
+  StartSignupChallengeInput,
+  StartPasswordResetChallengeInput,
+  AuthChallenge,
+  AuthChallengeResult,
+  RotateAuthChallengeResult,
+  VerifyAuthChallengeResult
 } from "../types.js";
 
 const { Pool } = pg;
@@ -50,21 +62,51 @@ function mapSubmission(row: pg.QueryResultRow): SubmissionRecord {
   };
 }
 
-function mapDestination(row: pg.QueryResultRow): DestinationRecord {
+function mapDestination(row: pg.QueryResultRow, key: string): DestinationRecord {
   return {
     id: row.destination_id ?? row.id,
     formId: row.destination_form_id ?? row.form_id,
     kind: row.kind,
-    config: row.config,
-    secret: row.secret,
+    ...decryptDestination(row.config, row.secret, key),
     active: row.active
   };
 }
 
 export class PostgresStore implements Store {
+  async saveSiteContact(input: { name: string; email: string; message: string }, key: string) {
+    await this.pool.query(`INSERT INTO site_contact_messages(name,email,message,idempotency_key)
+      VALUES ($1,$2,$3,$4) ON CONFLICT (idempotency_key) DO NOTHING`, [input.name, input.email, input.message, key]);
+  }
+  async listSiteContacts(page: number, limit: number) {
+    const { rows } = await this.pool.query(`SELECT id,name,email,message,created_at AS "createdAt"
+      FROM site_contact_messages ORDER BY created_at DESC,id DESC LIMIT $1 OFFSET $2`, [limit, (page - 1) * limit]);
+    const count = await this.pool.query("SELECT count(*) FROM site_contact_messages");
+    return { messages: rows.map(row => ({ id: row.id as string, name: row.name as string, email: row.email as string, message: row.message as string, createdAt: new Date(row.createdAt).toISOString() })), total: Number(count.rows[0].count) };
+  }
+  async deleteSiteContact(id: string) {
+    return (await this.pool.query("DELETE FROM site_contact_messages WHERE id=$1", [id])).rowCount === 1;
+  }
+
+  async withLoginState<T>(key: string, action: (state: import("../login-lockout.js").LoginState) => Promise<T>): Promise<T> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("INSERT INTO login_lockouts(account_key) VALUES ($1) ON CONFLICT DO NOTHING", [key]);
+      const { rows } = await client.query("SELECT * FROM login_lockouts WHERE account_key = $1 FOR UPDATE", [key]);
+      const state = { failures: rows[0].failures, level: rows[0].level, lockedUntil: Number(rows[0].locked_until) };
+      const result = await action(state);
+      await client.query("UPDATE login_lockouts SET failures=$2, level=$3, locked_until=$4 WHERE account_key=$1", [key, state.failures, state.level, state.lockedUntil]);
+      await client.query("COMMIT");
+      return result;
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally { client.release(); }
+  }
+
   private readonly pool: pg.Pool;
 
-  constructor(databaseUrl: string) {
+  constructor(databaseUrl: string, private readonly encryptionKey = process.env.DATA_ENCRYPTION_KEY ?? "") {
     this.pool = new Pool({ connectionString: databaseUrl });
   }
 
@@ -81,7 +123,7 @@ export class PostgresStore implements Store {
     const client = await this.pool.connect();
     try {
       await client.query("begin");
-      const tenant = await client.query("insert into tenants(name) values($1) returning id", [tenantName]);
+      const tenant = await client.query("insert into tenants(name) values($1) returning id", [tenantSlug(tenantName)]);
       await client.query(
         "insert into admin_users(email, password_hash, role, tenant_id) values($1, $2, 'tenant', $3)",
         [email, passwordHash, tenant.rows[0].id]
@@ -95,14 +137,329 @@ export class PostgresStore implements Store {
       client.release();
     }
   }
+  async checkAuthRateLimit(key: string, windowSeconds: number, max: number, now: Date) {
+    const expiresAt = new Date(now.getTime() + windowSeconds * 1000);
+    const result = await this.pool.query(
+      `insert into auth_rate_limits(key, window_started_at, count, expires_at)
+       values($1, $2, 1, $3)
+       on conflict (key) do update set
+         count = case when auth_rate_limits.expires_at <= $2 then 1 else auth_rate_limits.count + 1 end,
+         window_started_at = case when auth_rate_limits.expires_at <= $2 then $2 else auth_rate_limits.window_started_at end,
+         expires_at = case when auth_rate_limits.expires_at <= $2 then $3 else auth_rate_limits.expires_at end
+       returning count, expires_at`,
+      [key, now, expiresAt]
+    );
+    const row = result.rows[0];
+    const allowed = Number(row.count) <= max;
+    return {
+      allowed,
+      retryAfterSeconds: allowed ? 0 : Math.max(1, Math.ceil((new Date(row.expires_at).getTime() - now.getTime()) / 1000))
+    };
+  }
+
+  async startSignupChallenge(input: StartSignupChallengeInput): Promise<AuthChallengeResult> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("begin");
+      await client.query("select pg_advisory_xact_lock(hashtextextended($1,0))", [`signup:${input.email}`]);
+      const active = await client.query(
+        `select * from auth_challenges
+         where email=$1 and purpose='signup' and consumed_at is null and expires_at > $2
+         order by created_at desc limit 1 for update`,
+        [input.email, input.now]
+      );
+      if (active.rowCount && new Date(active.rows[0].resend_available_at) > input.now) {
+        const row = active.rows[0];
+        const eligible = Boolean(row.pending_signup_id) && !(await client.query("select 1 from admin_users where email=$1", [input.email])).rowCount;
+        await client.query("commit");
+        return { challengeId: row.id, expiresAt: new Date(row.expires_at), resendAvailableAt: new Date(row.resend_available_at), shouldSend: false, eligible };
+      }
+
+      await client.query("update auth_challenges set consumed_at=$2 where email=$1 and purpose='signup' and consumed_at is null", [input.email, input.now]);
+      const existing = await client.query("select id from admin_users where email=$1", [input.email]);
+      if (existing.rowCount) {
+        await client.query(
+          `insert into auth_challenges(id,purpose,email,otp_hash,expires_at,resend_available_at,max_attempts)
+           values($1,'signup',$2,$3,$4,$5,$6)`,
+          [input.challengeId, input.email, input.otpHash, input.expiresAt, input.resendAvailableAt, input.maxAttempts]
+        );
+        await client.query("commit");
+        return { challengeId: input.challengeId, expiresAt: input.expiresAt, resendAvailableAt: input.resendAvailableAt, shouldSend: false, eligible: false };
+      }
+
+      const pending = await client.query("select id, expires_at from pending_signups where email=$1 for update", [input.email]);
+      let pendingId: string;
+      if (!pending.rowCount) {
+        const inserted = await client.query(
+          `insert into pending_signups(email,workspace_name,password_hash,phone,expires_at)
+           values($1,$2,$3,$4,$5) returning id`,
+          [input.email, input.workspaceName, input.passwordHash, input.phone ?? null, new Date(input.now.getTime() + 24 * 60 * 60 * 1000)]
+        );
+        pendingId = inserted.rows[0].id;
+      } else {
+        await client.query(
+          "update pending_signups set workspace_name=$2,password_hash=$3,phone=$4,expires_at=$5,created_at=$6 where id=$1",
+          [pending.rows[0].id, input.workspaceName, input.passwordHash, input.phone ?? null, new Date(input.now.getTime() + 24 * 60 * 60 * 1000), input.now]
+        );
+        pendingId = pending.rows[0].id;
+      }
+
+      await client.query(
+        `insert into auth_challenges(id,purpose,email,pending_signup_id,otp_hash,expires_at,resend_available_at,max_attempts)
+         values($1,'signup',$2,$3,$4,$5,$6,$7)`,
+        [input.challengeId, input.email, pendingId, input.otpHash, input.expiresAt, input.resendAvailableAt, input.maxAttempts]
+      );
+      await client.query("commit");
+      return { challengeId: input.challengeId, expiresAt: input.expiresAt, resendAvailableAt: input.resendAvailableAt, shouldSend: true, eligible: true };
+    } catch (error) {
+      await client.query("rollback");
+      throw error;
+    } finally { client.release(); }
+  }
+
+  async startPasswordResetChallenge(input: StartPasswordResetChallengeInput): Promise<AuthChallengeResult> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("begin");
+      await client.query("select pg_advisory_xact_lock(hashtextextended($1,0))", [`password_reset:${input.email}`]);
+      const active = await client.query(
+        `select * from auth_challenges
+         where email=$1 and purpose='password_reset' and consumed_at is null and expires_at > $2
+         order by created_at desc limit 1 for update`,
+        [input.email, input.now]
+      );
+      if (active.rowCount && new Date(active.rows[0].resend_available_at) > input.now) {
+        const row = active.rows[0];
+        await client.query("commit");
+        return { challengeId: row.id, expiresAt: new Date(row.expires_at), resendAvailableAt: new Date(row.resend_available_at), shouldSend: false, eligible: Boolean(row.admin_id) };
+      }
+      await client.query("update auth_challenges set consumed_at=$2 where email=$1 and purpose='password_reset' and consumed_at is null", [input.email, input.now]);
+      const admin = await client.query("select id from admin_users where email=$1 and role='tenant'", [input.email]);
+      const adminId = admin.rowCount ? admin.rows[0].id as string : null;
+      await client.query(
+        `insert into auth_challenges(id,purpose,email,admin_id,otp_hash,expires_at,resend_available_at,max_attempts)
+         values($1,'password_reset',$2,$3,$4,$5,$6,$7)`,
+        [input.challengeId, input.email, adminId, input.otpHash, input.expiresAt, input.resendAvailableAt, input.maxAttempts]
+      );
+      await client.query("commit");
+      return { challengeId: input.challengeId, expiresAt: input.expiresAt, resendAvailableAt: input.resendAvailableAt, shouldSend: Boolean(adminId), eligible: Boolean(adminId) };
+    } catch (error) {
+      await client.query("rollback");
+      throw error;
+    } finally { client.release(); }
+  }
+
+  async getAuthChallenge(challengeId: string): Promise<AuthChallenge | null> {
+    const result = await this.pool.query(
+      "select id,purpose,email,pending_signup_id,admin_id,expires_at,resend_available_at,consumed_at from auth_challenges where id=$1",
+      [challengeId]
+    );
+    if (!result.rowCount) return null;
+    const row = result.rows[0];
+    return {
+      id: row.id, purpose: row.purpose, email: row.email, pendingSignupId: row.pending_signup_id,
+      adminId: row.admin_id, expiresAt: new Date(row.expires_at), resendAvailableAt: new Date(row.resend_available_at),
+      consumedAt: row.consumed_at ? new Date(row.consumed_at) : null
+    };
+  }
+
+  async rotateAuthChallenge(input: { challengeId: string; otpHash: string; expiresAt: Date; resendAvailableAt: Date; now: Date }): Promise<RotateAuthChallengeResult> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("begin");
+      const result = await client.query("select * from auth_challenges where id=$1 for update", [input.challengeId]);
+      if (!result.rowCount) { await client.query("rollback"); return { status: "not_found" }; }
+      const row = result.rows[0];
+      if (row.consumed_at) { await client.query("rollback"); return { status: "invalid" }; }
+      if (row.locked_until && new Date(row.locked_until) > input.now) {
+        await client.query("rollback");
+        return { status: "locked", retryAfterSeconds: Math.max(1, Math.ceil((new Date(row.locked_until).getTime() - input.now.getTime()) / 1000)) };
+      }
+      if (new Date(row.resend_available_at) > input.now) {
+        await client.query("rollback");
+        return { status: "cooldown", retryAfterSeconds: Math.max(1, Math.ceil((new Date(row.resend_available_at).getTime() - input.now.getTime()) / 1000)) };
+      }
+      let shouldSend = false;
+      if (row.purpose === "signup") {
+        if (row.pending_signup_id) {
+          const pending = await client.query("select expires_at from pending_signups where id=$1", [row.pending_signup_id]);
+          if (!pending.rowCount || new Date(pending.rows[0].expires_at) <= input.now) { await client.query("rollback"); return { status: "expired" }; }
+          shouldSend = !(await client.query("select 1 from admin_users where email=$1", [row.email])).rowCount;
+        }
+      } else if (row.admin_id) {
+        const admin = await client.query("select 1 from admin_users where id=$1 and role='tenant'", [row.admin_id]);
+        shouldSend = Boolean(admin.rowCount);
+      }
+      await client.query(
+        `update auth_challenges set otp_hash=$2,expires_at=$3,resend_available_at=$4,attempts=0,locked_until=null
+         where id=$1`,
+        [row.id, input.otpHash, input.expiresAt, input.resendAvailableAt]
+      );
+      await client.query("commit");
+      return { status: "ok", email: row.email, expiresAt: input.expiresAt, resendAvailableAt: input.resendAvailableAt, shouldSend };
+    } catch (error) {
+      await client.query("rollback");
+      throw error;
+    } finally { client.release(); }
+  }
+
+  async verifySignupChallenge(input: { challengeId: string; otpHash: string; now: Date }): Promise<VerifyAuthChallengeResult> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("begin");
+      const result = await client.query(
+        `select c.*, p.workspace_name, p.password_hash, p.phone, p.expires_at as pending_expires_at
+         from auth_challenges c left join pending_signups p on p.id=c.pending_signup_id
+         where c.id=$1 and c.purpose='signup' for update of c`,
+        [input.challengeId]
+      );
+      if (!result.rowCount) { await client.query("rollback"); return { status: "not_found", attemptsRemaining: 0, retryAfterSeconds: 0 }; }
+      const row = result.rows[0];
+      const check = await this.checkChallengeForVerification(client, row, input.now);
+      if (check) { await client.query(check.commit ? "commit" : "rollback"); return check.result; }
+      if (!otpMatches(row.otp_hash, input.otpHash)) {
+        const failure = await this.recordChallengeFailure(client, row, input.now);
+        await client.query("commit");
+        return failure;
+      }
+      if (!row.pending_signup_id || !row.workspace_name || !row.password_hash || new Date(row.pending_expires_at) <= input.now) {
+        await client.query("rollback");
+        return { status: "expired", attemptsRemaining: 0, retryAfterSeconds: 0 };
+      }
+      try {
+        const tenant = await client.query("insert into tenants(name) values($1) returning id", [tenantSlug(row.workspace_name)]);
+        await client.query(
+          "insert into admin_users(email,password_hash,role,tenant_id) values($1,$2,'tenant',$3)",
+          [row.email, row.password_hash, tenant.rows[0].id]
+        );
+        await client.query("update auth_challenges set consumed_at=$2, pending_signup_id=null where id=$1", [row.id, input.now]);
+        await client.query("delete from pending_signups where id=$1", [row.pending_signup_id]);
+        await client.query("commit");
+        return { status: "ok", attemptsRemaining: 0, retryAfterSeconds: 0, tenantId: tenant.rows[0].id as string };
+      } catch (error) {
+        await client.query("rollback");
+        if (typeof error === "object" && error && "code" in error && error.code === "23505") {
+          return { status: "invalid", attemptsRemaining: 0, retryAfterSeconds: 0 };
+        }
+        throw error;
+      }
+    } catch (error) {
+      await client.query("rollback");
+      throw error;
+    } finally { client.release(); }
+  }
+
+  async verifyPasswordResetChallenge(input: { challengeId: string; otpHash: string; resetTokenHash: string; resetTokenExpiresAt: Date; now: Date }): Promise<VerifyAuthChallengeResult> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("begin");
+      const result = await client.query("select * from auth_challenges where id=$1 and purpose='password_reset' for update", [input.challengeId]);
+      if (!result.rowCount) { await client.query("rollback"); return { status: "not_found", attemptsRemaining: 0, retryAfterSeconds: 0 }; }
+      const row = result.rows[0];
+      const check = await this.checkChallengeForVerification(client, row, input.now);
+      if (check) { await client.query(check.commit ? "commit" : "rollback"); return check.result; }
+      if (!otpMatches(row.otp_hash, input.otpHash) || !row.admin_id) {
+        const failure = await this.recordChallengeFailure(client, row, input.now);
+        await client.query("commit");
+        return failure;
+      }
+      const admin = await client.query("select email from admin_users where id=$1 and role='tenant'", [row.admin_id]);
+      if (!admin.rowCount) {
+        const failure = await this.recordChallengeFailure(client, row, input.now);
+        await client.query("commit");
+        return failure;
+      }
+      await client.query(
+        `update auth_challenges set consumed_at=$2,reset_token_hash=$3,reset_token_expires_at=$4,reset_consumed_at=null
+         where id=$1`,
+        [row.id, input.now, input.resetTokenHash, input.resetTokenExpiresAt]
+      );
+      await client.query("commit");
+      return { status: "ok", attemptsRemaining: 0, retryAfterSeconds: 0, email: admin.rows[0].email, adminId: row.admin_id };
+    } catch (error) {
+      await client.query("rollback");
+      throw error;
+    } finally { client.release(); }
+  }
+
+  private async checkChallengeForVerification(client: pg.PoolClient, row: pg.QueryResultRow, now: Date): Promise<{ commit: boolean; result: VerifyAuthChallengeResult } | null> {
+    if (row.consumed_at) return { commit: false, result: { status: "invalid", attemptsRemaining: 0, retryAfterSeconds: 0 } };
+    if (row.locked_until && new Date(row.locked_until) > now) {
+      return { commit: false, result: { status: "locked", attemptsRemaining: 0, retryAfterSeconds: Math.max(1, Math.ceil((new Date(row.locked_until).getTime() - now.getTime()) / 1000)) } };
+    }
+    if (new Date(row.expires_at) <= now) return { commit: false, result: { status: "expired", attemptsRemaining: 0, retryAfterSeconds: 0 } };
+    if (Number(row.attempts) >= Number(row.max_attempts)) {
+      const lockedUntil = new Date(now.getTime() + 15 * 60 * 1000);
+      await client.query("update auth_challenges set locked_until=$2 where id=$1", [row.id, lockedUntil]);
+      return { commit: true, result: { status: "locked", attemptsRemaining: 0, retryAfterSeconds: 900 } };
+    }
+    return null;
+  }
+
+  private async recordChallengeFailure(client: pg.PoolClient, row: pg.QueryResultRow, now: Date): Promise<VerifyAuthChallengeResult> {
+    const attempts = Number(row.attempts) + 1;
+    const remaining = Math.max(0, Number(row.max_attempts) - attempts);
+    if (remaining === 0) {
+      const lockedUntil = new Date(now.getTime() + 15 * 60 * 1000);
+      await client.query("update auth_challenges set attempts=$2,locked_until=$3 where id=$1", [row.id, attempts, lockedUntil]);
+      return { status: "locked", attemptsRemaining: 0, retryAfterSeconds: 900 };
+    }
+    await client.query("update auth_challenges set attempts=$2 where id=$1", [row.id, attempts]);
+    return { status: "invalid", attemptsRemaining: remaining, retryAfterSeconds: 0 };
+  }
+
+  async resetPasswordWithToken(input: { tokenHash: string; passwordHash: string; now: Date }) {
+    const client = await this.pool.connect();
+    try {
+      await client.query("begin");
+      const result = await client.query(
+        `select c.id, c.admin_id, u.email from auth_challenges c
+         join admin_users u on u.id=c.admin_id
+         where c.purpose='password_reset' and c.reset_token_hash=$1
+           and c.reset_token_expires_at > $2 and c.reset_consumed_at is null and c.consumed_at is not null
+         for update of c`,
+        [input.tokenHash, input.now]
+      );
+      if (!result.rowCount) { await client.query("rollback"); return null; }
+      const row = result.rows[0];
+      await client.query("update admin_users set password_hash=$2 where id=$1", [row.admin_id, input.passwordHash]);
+      await client.query("delete from admin_sessions where admin_id=$1", [row.admin_id]);
+      await client.query("update auth_challenges set reset_token_hash=null,reset_consumed_at=$2 where id=$1", [row.id, input.now]);
+      await client.query("commit");
+      return { email: row.email as string, adminId: row.admin_id as string };
+    } catch (error) {
+      await client.query("rollback");
+      throw error;
+    } finally { client.release(); }
+  }
+
+  async deleteExpiredAuthData(now: Date): Promise<number> {
+    const result = await this.pool.query(
+      `with deleted_challenges as (
+         delete from auth_challenges
+         where expires_at < $1 - interval '1 day' or (consumed_at is not null and consumed_at < $1 - interval '1 day')
+         returning 1
+       ), deleted_signups as (
+         delete from pending_signups where expires_at < $1 returning 1
+       ), deleted_limits as (
+         delete from auth_rate_limits where expires_at < $1 returning 1
+       )
+       select (select count(*) from deleted_challenges) + (select count(*) from deleted_signups) + (select count(*) from deleted_limits) as total`,
+      [now]
+    );
+    return Number(result.rows[0].total);
+  }
+
 
   async createForm(input: CreateFormInput, publicKey: string): Promise<FormRecord> {
+    const name = formSlug(input.name);
+    if (!name || name.length > 200) throw Object.assign(new Error("Invalid form name"), { code: "22P02" });
     const client = await this.pool.connect();
     try {
       await client.query("begin");
       const tenant = input.tenantId
         ? await client.query("select id from tenants where id = $1", [input.tenantId])
-        : await client.query("insert into tenants(name) values($1) returning id", [input.tenantName]);
+        : await client.query("insert into tenants(name) values($1) returning id", [tenantSlug(input.tenantName)]);
       if (!tenant.rowCount) throw new Error("Tenant not found");
       const form = await client.query(
         `insert into forms(tenant_id, public_key, name, allowed_origins, success_message, honeypot_field)
@@ -111,7 +468,7 @@ export class PostgresStore implements Store {
         [
           tenant.rows[0].id,
           publicKey,
-          input.name,
+          name,
           input.allowedOrigins,
           input.successMessage ?? "Thank you. We received your message.",
           input.honeypotField ?? "_website"
@@ -124,7 +481,7 @@ export class PostgresStore implements Store {
       for (const destination of input.destinations ?? []) {
         await client.query(
           "insert into destinations(form_id, kind, config, secret, active) values($1, $2, $3, $4, true)",
-          [form.rows[0].id, destination.kind, destination.config, destination.secret ?? null]
+          [form.rows[0].id, destination.kind, encryptDestination(destination, this.encryptionKey), null]
         );
       }
       await client.query("commit");
@@ -162,7 +519,14 @@ export class PostgresStore implements Store {
     return result.rowCount ? mapForm(result.rows[0]) : null;
   }
 
-  async updateForm(publicKey: string, input: Partial<Pick<CreateFormInput, "name" | "allowedOrigins" | "successMessage" | "schema">> & { status?: "active" | "disabled" }): Promise<FormRecord | null> {
+  async getFormDestinations(publicKey: string): Promise<DestinationRecord[]> {
+    const result = await this.pool.query("SELECT d.* FROM destinations d JOIN forms f ON f.id=d.form_id WHERE f.public_key=$1 AND d.active=true ORDER BY d.id", [publicKey]);
+    return result.rows.map(row => mapDestination(row, this.encryptionKey));
+  }
+
+  async updateForm(publicKey: string, input: Partial<Pick<CreateFormInput, "name" | "allowedOrigins" | "successMessage" | "schema" | "destinations">> & { status?: "active" | "disabled" }): Promise<FormRecord | null> {
+    const name = input.name === undefined ? null : formSlug(input.name);
+    if (input.name !== undefined && (!name || name.length > 200)) throw Object.assign(new Error("Invalid form name"), { code: "22P02" });
     const client = await this.pool.connect();
     try {
       await client.query("begin");
@@ -171,9 +535,17 @@ export class PostgresStore implements Store {
           name = coalesce($2, name), allowed_origins = coalesce($3, allowed_origins),
           success_message = coalesce($4, success_message), status = coalesce($5, status)
          where public_key = $1 returning *`,
-        [publicKey, input.name ?? null, input.allowedOrigins ?? null, input.successMessage ?? null, input.status ?? null]
+        [publicKey, name, input.allowedOrigins ?? null, input.successMessage ?? null, input.status ?? null]
       );
       if (!updated.rowCount) { await client.query("rollback"); return null; }
+      if (input.destinations !== undefined) {
+        // Retain old destinations for already queued deliveries; new submissions use the new settings.
+        await client.query("UPDATE destinations SET active=false WHERE form_id=$1", [updated.rows[0].id]);
+        for (const destination of input.destinations) {
+          await client.query("INSERT INTO destinations(form_id,kind,config,secret,active) VALUES($1,$2,$3,NULL,true)",
+            [updated.rows[0].id, destination.kind, encryptDestination(destination, this.encryptionKey)]);
+        }
+      }
       let version: number;
       let schema: JsonObject;
       const current = await client.query("select version, schema from form_versions where form_id = $1 order by version desc limit 1", [updated.rows[0].id]);
@@ -194,6 +566,7 @@ export class PostgresStore implements Store {
   }
 
   async createSubmission(args: {
+    skipAutomatic?: boolean;
     form: FormRecord;
     payload: JsonObject;
     status: SubmissionStatus;
@@ -207,6 +580,7 @@ export class PostgresStore implements Store {
     try {
       await client.query("begin");
       if (args.idempotencyKey) {
+        await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`${args.form.id}:${args.idempotencyKey}`]);
         const existing = await client.query(
           "select * from submissions where form_id = $1 and idempotency_key = $2",
           [args.form.id, args.idempotencyKey]
@@ -234,12 +608,12 @@ export class PostgresStore implements Store {
           args.expiresAt
         ]
       );
-      if (args.status === "accepted") {
-        await client.query(
-          `insert into outbox_jobs(submission_id, destination_id)
-           select $1, id from destinations where form_id = $2 and active = true`,
-          [inserted.rows[0].id, args.form.id]
-        );
+      if (args.status === "accepted" && !args.skipAutomatic) {
+        const destinations = await client.query("SELECT * FROM destinations WHERE form_id=$1 AND active=true", [args.form.id]);
+        for (const row of destinations.rows) {
+          if (mapDestination(row, this.encryptionKey).config.deliveryMode === "manual") continue;
+          await client.query("INSERT INTO outbox_jobs(submission_id,destination_id) VALUES($1,$2)", [inserted.rows[0].id, row.id]);
+        }
       }
       await client.query("commit");
       return { submission: mapSubmission(inserted.rows[0]), duplicate: false };
@@ -320,6 +694,7 @@ export class PostgresStore implements Store {
       }
       if (query.from) where.push(`s.created_at >= ${bind(query.from)}::timestamptz`);
       if (query.to) where.push(`s.created_at <= ${bind(query.to)}::timestamptz`);
+      where.push(...payloadConditions(query.fields, bind));
       source = `select s.id, s.created_at, f.name, 0 as usage,
         jsonb_build_object('id',s.id,'payload',s.payload,'status',s.status,'createdAt',s.created_at,'sourceOrigin',s.source_origin,'formName',f.name,'formPublicKey',f.public_key,'tenantName',t.name) as item
         from submissions s join forms f on f.id=s.form_id join tenants t on t.id=s.tenant_id where ${where.join(" and ")}`;
@@ -331,7 +706,7 @@ export class PostgresStore implements Store {
       if (query.from) dates.push(`s.created_at >= ${bind(query.from)}::timestamptz`);
       if (query.to) dates.push(`s.created_at <= ${bind(query.to)}::timestamptz`);
       source = `select f.id, f.created_at, f.name, stats.total as usage,
-        jsonb_build_object('publicKey',f.public_key,'tenantId',f.tenant_id,'tenantName',t.name,'name',f.name,'status',f.status,'allowedOrigins',f.allowed_origins,'submissionCount',stats.total,'acceptedCount',stats.accepted,'spamCount',stats.spam,'lastSubmittedAt',stats.last_at,'schema',v.schema,'successMessage',f.success_message) as item
+        jsonb_build_object('publicKey',f.public_key,'tenantId',f.tenant_id,'tenantName',t.name,'name',f.name,'status',f.status,'allowedOrigins',f.allowed_origins,'submissionCount',stats.total,'acceptedCount',stats.accepted,'spamCount',stats.spam,'lastSubmittedAt',stats.last_at,'schema',v.schema,'successMessage',f.success_message,'honeypotField',f.honeypot_field) as item
         from forms f join tenants t on t.id=f.tenant_id
         join lateral (select schema from form_versions where form_id=f.id order by version desc limit 1) v on true
         cross join lateral (select count(*)::int total, count(*) filter(where s.status='accepted')::int accepted, count(*) filter(where s.status='spam')::int spam, max(s.created_at) last_at from submissions s where ${dates.join(" and ")}) stats
@@ -370,7 +745,7 @@ export class PostgresStore implements Store {
   }
 
   async createTenant(name: string): Promise<string> {
-    const result = await this.pool.query("insert into tenants(name) values($1) returning id", [name]);
+    const result = await this.pool.query("insert into tenants(name) values($1) returning id", [tenantSlug(name)]);
     return result.rows[0].id as string;
   }
 
@@ -423,6 +798,16 @@ export class PostgresStore implements Store {
   async getTenantIdForSubmission(submissionId: string): Promise<string | null> {
     const result = await this.pool.query("select tenant_id from submissions where id=$1", [submissionId]);
     return result.rowCount ? result.rows[0].tenant_id as string : null;
+  }
+
+  async deleteForm(publicKey: string): Promise<boolean> {
+    const result = await this.pool.query("delete from forms where public_key=$1", [publicKey]);
+    return Boolean(result.rowCount);
+  }
+
+  async deleteSubmission(submissionId: string): Promise<boolean> {
+    const result = await this.pool.query("delete from submissions where id=$1", [submissionId]);
+    return Boolean(result.rowCount);
   }
 
   async updateSubmission(submissionId: string, payload: JsonObject, status: SubmissionStatus): Promise<boolean> {
@@ -570,14 +955,15 @@ export class PostgresStore implements Store {
           claimed.active`,
         [limit]
       );
-      await client.query("commit");
-      return result.rows.map((row) => ({
+      const jobs = result.rows.map((row) => ({
         id: row.id,
         attempts: Number(row.attempts),
-        submission: mapSubmission(row),
+        submission: mapSubmission({ ...row, id: row.submission_id }),
         form: { id: row.form_id, name: row.form_name },
-        destination: mapDestination(row)
+        destination: mapDestination(row, this.encryptionKey)
       }));
+      await client.query("commit");
+      return jobs;
     } catch (error) {
       await client.query("rollback");
       throw error;
@@ -588,6 +974,60 @@ export class PostgresStore implements Store {
 
   async markJobDelivered(id: string): Promise<void> {
     await this.pool.query("update outbox_jobs set status = 'delivered', updated_at = now() where id = $1", [id]);
+  }
+
+  async deliveryStatus(publicKey: string, submissionId: string): Promise<JsonObject[]> {
+    const result = await this.pool.query(`SELECT j.id,d.kind,j.status,j.attempts,j.last_error FROM outbox_jobs j
+      JOIN destinations d ON d.id=j.destination_id JOIN submissions s ON s.id=j.submission_id
+      JOIN forms f ON f.id=s.form_id WHERE f.public_key=$1 AND s.id=$2 ORDER BY j.created_at`, [publicKey, submissionId]);
+    return result.rows.map(({ last_error, ...row }) => ({ ...row, error: row.status === "delivered" ? null : publicDeliveryError(last_error) }));
+  }
+
+  async findReplySubmissions(publicKey: string, filters: ReplyFilters): Promise<string[]> {
+    const values: unknown[] = [publicKey];
+    const bind = (value: unknown) => { values.push(value); return `$${values.length}`; };
+    const where = ["f.public_key=$1", "s.status='accepted'", "s.expires_at>now()", ...payloadConditions(filters.fields, bind)];
+    if (filters.q) { const q = bind(`%${filters.q}%`); where.push(`(s.payload::text ILIKE ${q} OR f.name ILIKE ${q} OR t.name ILIKE ${q})`); }
+    if (filters.from) where.push(`s.created_at>=${bind(filters.from)}::timestamptz`);
+    if (filters.to) where.push(`s.created_at<=${bind(filters.to)}::timestamptz`);
+    const result = await this.pool.query(`SELECT s.id FROM submissions s JOIN forms f ON f.id=s.form_id JOIN tenants t ON t.id=s.tenant_id WHERE ${where.join(" AND ")} ORDER BY s.id LIMIT 10001`, values);
+    return result.rows.map(row => row.id);
+  }
+
+  async queueReplies(publicKey: string, submissionIds: string[], destinationIds: string[], message: string, requestId: string, subject?: string): Promise<number> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const forms = await client.query("SELECT id FROM forms WHERE public_key=$1 AND status='active' FOR UPDATE", [publicKey]);
+      if (!forms.rowCount) throw new Error("Form not found or disabled.");
+      const formId = forms.rows[0].id;
+      const previous = await client.query("SELECT queued FROM reply_batches WHERE form_id=$1 AND request_id=$2", [formId, requestId]);
+      if (previous.rowCount) { await client.query("COMMIT"); return previous.rows[0].queued; }
+      const submissions = await client.query("SELECT id,payload FROM submissions WHERE form_id=$1 AND id=ANY($2::uuid[]) AND status='accepted' AND expires_at>now() FOR SHARE", [formId, submissionIds]);
+      const destinations = await client.query("SELECT * FROM destinations WHERE form_id=$1 AND id=ANY($2::uuid[]) AND active=true FOR SHARE", [formId, destinationIds]);
+      if (submissions.rowCount !== submissionIds.length || destinations.rowCount !== destinationIds.length) throw new Error("Select accepted, unexpired submissions and current integrations from this form.");
+      let queued = 0;
+      for (const row of destinations.rows) {
+        const destination = mapDestination(row, this.encryptionKey);
+        const eligibleIds = submissions.rows.filter(row => {
+          if (!["email", "sms", "whatsapp"].includes(destination.kind)) return true;
+          const recipient = destination.config.recipientField ? row.payload[String(destination.config.recipientField)] : destination.config.to;
+          return (destination.kind === "email" ? z.string().email() : z.string().regex(/^\+[1-9]\d{7,14}$/)).safeParse(recipient).success;
+        }).map(row => row.id);
+        if (!eligibleIds.length) continue;
+        const max = destination.kind === "discord" ? 2000 : destination.kind === "sms" ? 1600 : 8000;
+        if (message.length > max) throw new Error(`Message exceeds the ${max} character limit for ${destination.kind}.`);
+        // Snapshot the message and credentials so later edits cannot change a queued reply.
+        const snapshot = await client.query("INSERT INTO destinations(form_id,kind,config,active) VALUES($1,$2,$3,false) RETURNING id", [formId, destination.kind,
+          encryptDestination({ kind: destination.kind, config: { ...destination.config, ...(message ? { template: message, eventType: "form.reply.created" } : {}), ...(subject && destination.kind === "email" ? { subject } : {}) }, secret: destination.secret ?? undefined }, this.encryptionKey)]);
+        await client.query("INSERT INTO outbox_jobs(submission_id,destination_id) SELECT unnest($1::uuid[]),$2", [eligibleIds, snapshot.rows[0].id]);
+        queued += eligibleIds.length;
+      }
+      await client.query("INSERT INTO reply_batches(form_id,request_id,queued) VALUES($1,$2,$3)", [formId, requestId, queued]);
+      await client.query("COMMIT");
+      return queued;
+    } catch (error) { await client.query("ROLLBACK"); throw error; }
+    finally { client.release(); }
   }
 
   async markJobFailed(id: string, attempts: number, error: string): Promise<void> {

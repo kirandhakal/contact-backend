@@ -3,13 +3,14 @@ import { deliverJob } from "./delivery.js";
 import { PostgresStore } from "./db/postgres-store.js";
 
 const config = getConfig();
-const store = new PostgresStore(config.DATABASE_URL);
+const store = new PostgresStore(config.DATABASE_URL, config.DATA_ENCRYPTION_KEY);
 let lastCleanup = 0;
 
 async function tick() {
   const now = Date.now();
   if (now - lastCleanup > 24 * 60 * 60 * 1000) {
     await store.deleteExpiredSubmissions(new Date());
+    await store.deleteExpiredAuthData(new Date());
     lastCleanup = now;
   }
 
@@ -26,9 +27,15 @@ async function tick() {
   }
 }
 
-const interval = setInterval(() => {
-  tick().catch((error) => console.error(error));
-}, config.WORKER_POLL_MS);
+let running = false;
+async function runTick() {
+  if (running) return;
+  running = true;
+  try { await tick(); }
+  catch (error) { console.error(error); }
+  finally { running = false; }
+}
+const interval = setInterval(() => { void runTick(); }, config.WORKER_POLL_MS);
 
 process.on("SIGINT", async () => {
   clearInterval(interval);
@@ -36,4 +43,4 @@ process.on("SIGINT", async () => {
   process.exit(0);
 });
 
-void tick();
+void runTick();

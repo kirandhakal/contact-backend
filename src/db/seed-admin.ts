@@ -10,7 +10,7 @@ async function main() {
     throw new Error("Set SEED_ADMIN_EMAIL and SEED_ADMIN_PASSWORD (8–256 characters) before seeding an administrator.");
   }
   const config = getConfig();
-  const store = new PostgresStore(config.DATABASE_URL);
+  const store = new PostgresStore(config.DATABASE_URL, config.DATA_ENCRYPTION_KEY);
   try {
     const existing = await store.getAdminByEmail(email);
     if (existing) {
