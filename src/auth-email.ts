@@ -1,5 +1,8 @@
 import nodemailer from "nodemailer";
 import type { AppConfig } from "./config.js";
+import { brand } from "./brand.js";
+
+const c = brand.colors;
 
 export type AuthEmailMessage =
   | { kind: "signup_code"; to: string; code: string; expiresMinutes: number }
@@ -73,8 +76,8 @@ function emailContent(message: AuthEmailMessage): { subject: string; text: strin
         title: "Password updated",
         preview: "Your Contact password was changed.",
         body: `
-          <p style="margin:0 0 16px;font-size:16px;line-height:1.6;color:#34505c;">Your Contact workspace password was just changed.</p>
-          <p style="margin:0;font-size:15px;line-height:1.6;color:#5a6f79;">If you did not make this change, contact your service administrator immediately.</p>
+          <p style="margin:0 0 16px;font-size:16px;line-height:1.6;color:${c.foreground};">Your Contact workspace password was just changed.</p>
+          <p style="margin:0;font-size:15px;line-height:1.6;color:${c.muted};">If you did not make this change, contact your service administrator immediately.</p>
         `
       })
     };
@@ -85,7 +88,6 @@ function emailContent(message: AuthEmailMessage): { subject: string; text: strin
   const title = isSignup ? "Verify your email" : "Reset your password";
   const subject = isSignup ? "Your Contact verification code" : "Your Contact password reset code";
   const code = message.code;
-  const spaced = code.split("").join(" ");
   const text = `Your Contact code is ${code}\n\nUse this code to ${action}.\nIt expires in ${message.expiresMinutes} minutes.\n\nIf you did not request it, you can ignore this email.`;
 
   return {
@@ -95,12 +97,16 @@ function emailContent(message: AuthEmailMessage): { subject: string; text: strin
       title,
       preview: `Your verification code is ${code}. It expires in ${message.expiresMinutes} minutes.`,
       body: `
-        <p style="margin:0 0 8px;font-size:16px;line-height:1.6;color:#34505c;">Use this code to ${action}:</p>
-        <div style="margin:28px 0;padding:22px 16px;border-radius:14px;background:#edf5f1;border:1px solid #c9ddd4;text-align:center;">
-          <div style="font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:36px;letter-spacing:12px;font-weight:700;color:#145a46;line-height:1;">${escapeHtml(spaced)}</div>
-        </div>
-        <p style="margin:0 0 12px;font-size:15px;line-height:1.6;color:#5a6f79;">This code expires in <strong style="color:#34505c;">${message.expiresMinutes} minutes</strong>.</p>
-        <p style="margin:0;font-size:14px;line-height:1.6;color:#7a8b94;">If you did not request this, you can safely ignore this email.</p>
+        <p style="margin:0 0 8px;font-size:16px;line-height:1.6;color:${c.foreground};">Use this code to ${action}:</p>
+        <table role="presentation" cellspacing="0" cellpadding="0" style="margin:28px auto;border-collapse:separate;">
+          <tr>
+            <td align="center" style="padding:20px 24px;border-radius:14px;background:${c.primarySoft};border:1px solid ${c.primaryBorder};white-space:nowrap;">
+              <span style="display:inline-block;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:30px;letter-spacing:0.35em;font-weight:700;color:${c.primaryInk};line-height:1;white-space:nowrap;mso-line-height-rule:exactly;padding-left:0.35em;">${escapeHtml(code)}</span>
+            </td>
+          </tr>
+        </table>
+        <p style="margin:0 0 12px;font-size:15px;line-height:1.6;color:${c.muted};">This code expires in <strong style="color:${c.foreground};">${message.expiresMinutes} minutes</strong>.</p>
+        <p style="margin:0;font-size:14px;line-height:1.6;color:${c.muted};">If you did not request this, you can safely ignore this email.</p>
       `
     })
   };
@@ -114,23 +120,23 @@ function layout(input: { title: string; preview: string; body: string }): string
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>${escapeHtml(input.title)}</title>
 </head>
-<body style="margin:0;padding:0;background:#eef3f6;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif;">
+<body style="margin:0;padding:0;background:${c.background};font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif;">
   <div style="display:none;max-height:0;overflow:hidden;opacity:0;">${escapeHtml(input.preview)}</div>
-  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#eef3f6;padding:32px 16px;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:${c.background};padding:32px 16px;">
     <tr>
       <td align="center">
-        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:520px;background:#ffffff;border:1px solid #d7e0e5;border-radius:18px;overflow:hidden;">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:520px;background:${c.card};border:1px solid ${c.border};border-radius:18px;overflow:hidden;">
           <tr>
-            <td style="padding:28px 28px 18px;background:linear-gradient(180deg,#edf5f1 0%,#ffffff 100%);border-bottom:1px solid #e7edf0;">
-              <div style="font-size:22px;font-weight:700;letter-spacing:-0.4px;color:#145a46;">contact<span style="color:#5f8f78;">.</span></div>
-              <div style="margin-top:18px;font-size:12px;letter-spacing:1.4px;font-weight:700;text-transform:uppercase;color:#5f7d72;">${escapeHtml(input.title)}</div>
+            <td style="padding:28px 28px 18px;background:linear-gradient(180deg,${c.primarySoft} 0%,${c.card} 100%);border-bottom:1px solid ${c.border};">
+              <div style="font-size:22px;font-weight:700;letter-spacing:-0.4px;color:${c.primaryInk};">contact<span style="color:${c.primary};">.</span></div>
+              <div style="margin-top:18px;font-size:12px;letter-spacing:1.4px;font-weight:700;text-transform:uppercase;color:${c.muted};">${escapeHtml(input.title)}</div>
             </td>
           </tr>
           <tr>
             <td style="padding:28px;">${input.body}</td>
           </tr>
           <tr>
-            <td style="padding:18px 28px 26px;border-top:1px solid #e7edf0;font-size:13px;line-height:1.6;color:#7a8b94;">
+            <td style="padding:18px 28px 26px;border-top:1px solid ${c.border};font-size:13px;line-height:1.6;color:${c.muted};">
               Sent by Contact · Keep this code private
             </td>
           </tr>
