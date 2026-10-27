@@ -16,6 +16,19 @@ const EnvSchema = z.object({
   DATABASE_URL: z.string().default("postgres://forms:forms@localhost:5432/forms"),
   ADMIN_API_KEY: z.string().min(24),
   DATA_ENCRYPTION_KEY: z.string().regex(/^[a-fA-F0-9]{64}$/),
+  OTP_HMAC_KEY: z.string().regex(/^[a-fA-F0-9]{64}$/).optional(),
+  OTP_EXPIRY_SECONDS: z.coerce.number().int().positive().default(300),
+  OTP_RESEND_SECONDS: z.coerce.number().int().positive().default(60),
+  OTP_MAX_ATTEMPTS: z.coerce.number().int().positive().default(5),
+  AUTH_RESET_TOKEN_TTL_SECONDS: z.coerce.number().int().positive().default(600),
+  AUTH_MIN_RESPONSE_MS: z.coerce.number().int().min(0).default(150),
+  TRUST_PROXY: z.preprocess((value) => {
+    if (value === undefined || value === null || value === "") return false;
+    const boolean = boolFromEnv(value);
+    if (boolean !== undefined) return boolean;
+    if (typeof value === "string" && /^\d+$/.test(value)) return value;
+    return value;
+  }, z.union([z.boolean(), z.string()])).default(false),
   PUBLIC_BASE_URL: z.string().url().default("http://localhost:3100"),
   MAX_BODY_BYTES: z.coerce.number().int().positive().default(65536),
   RATE_LIMIT_WINDOW_SECONDS: z.coerce.number().int().positive().default(60),

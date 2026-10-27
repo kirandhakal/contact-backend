@@ -57,10 +57,25 @@ application instances. Apply migrations before starting the updated app.
 HTTP 429 includes `Retry-After`, `retryAfterSeconds`, and `lockedUntil`;
 the frontend displays a countdown and disables submission until it expires.
 
-### Signup and schema readiness
+### Email-verified signup and password reset
 
-Successful signup redirects the web app to `/login?signup=complete`; it does not
-attempt an automatic login. Users sign in explicitly after the confirmation.
+Tenant signup now creates a pending account and sends a six-digit code. The
+account and workspace are only created after `POST /v1/auth/signup/verify`
+accepts the correct code. Successful verification redirects the web app to
+`/login?signup=complete`; it does not attempt an automatic login.
+
+Tenant password reset uses `POST /v1/auth/forgot-password`, the matching
+`/verify` and `/resend` endpoints, then `POST /v1/auth/reset-password`. Reset
+tokens are single-use, short-lived, and revoked along with existing sessions.
+Unknown or ineligible emails receive the same response and no code.
+
+Codes are stored as keyed HMAC hashes, never plaintext. Defaults are a 5-minute
+expiry, 60-second resend cooldown, five attempts, and a 15-minute lock. Auth
+rate limits are persisted in PostgreSQL. Configure delivery with `SMTP_URL` or
+the `MAIL_*` variables. Set `OTP_HMAC_KEY` to a dedicated secret, or it falls
+back to `DATA_ENCRYPTION_KEY`. Set `TRUST_PROXY` only when a trusted reverse
+proxy supplies client IP headers. Locked challenges remain locked for 15 minutes.
+
 New workspace/tenant names are normalized with `slugify` (for example,
 `Acme Studio` becomes `acme-studio`). Names that produce an empty slug are rejected.
 Existing tenant names are preserved.

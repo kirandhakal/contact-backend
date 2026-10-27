@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { buildApp } from "../src/app.js";
+import type { AuthEmailMessage } from "../src/auth-email.js";
 import type { ListQuery, PageResult } from "../src/management.js";
 import type {
   CreateFormInput,
@@ -11,6 +12,7 @@ import type {
   OutboxJob,
   Store,
   SubmissionRecord,
+  AuthChallenge,
   SubmissionResult,
   SubmissionStatus
 } from "../src/types.js";
@@ -46,7 +48,13 @@ const config = {
   ENABLE_WHATSAPP: true,
   ENABLE_DISCORD: true,
   ENABLE_WEBHOOK: true,
-  ENABLE_MAIL: true
+  ENABLE_MAIL: true,
+  TRUST_PROXY: false,
+  OTP_EXPIRY_SECONDS: 300,
+  OTP_RESEND_SECONDS: 60,
+  OTP_MAX_ATTEMPTS: 5,
+  AUTH_RESET_TOKEN_TTL_SECONDS: 600,
+  AUTH_MIN_RESPONSE_MS: 0
 } as any;
 
 class MemoryStore implements Store {
@@ -84,6 +92,158 @@ class MemoryStore implements Store {
   admins = new Map<string, { id: string; email: string; passwordHash: string; role: AdminRole; tenantId: string | null }>();
   sessions = new Map<string, string>();
   tenants = new Map<string, { name: string; maxOriginsPerForm: number; maxForms: number; maxTotalSubmissions: number; maxDailySubmissions: number }>();
+
+  authChallenges = new Map<string, AuthChallenge & { otpHash: string; maxAttempts: number; attempts: number; lockedUntil: Date | null; resetTokenHash: string | null; resetTokenExpiresAt: Date | null; resetConsumedAt: Date | null }>();
+  pendingSignups = new Map<string, { id: string; workspaceName: string; passwordHash: string; phone: string | null; expiresAt: Date }>();
+  authRateLimits = new Map<string, { count: number; expiresAt: Date }>();
+  authEmails: AuthEmailMessage[] = [];
+
+  async checkAuthRateLimit(key: string, windowSeconds: number, max: number, now: Date) {
+    let entry = this.authRateLimits.get(key);
+    if (!entry || entry.expiresAt <= now) {
+      entry = { count: 0, expiresAt: new Date(now.getTime() + windowSeconds * 1000) };
+      this.authRateLimits.set(key, entry);
+    }
+    entry.count += 1;
+    const allowed = entry.count <= max;
+    return { allowed, retryAfterSeconds: allowed ? 0 : Math.max(1, Math.ceil((entry.expiresAt.getTime() - now.getTime()) / 1000)) };
+  }
+
+  async startSignupChallenge(input: import("../src/types.js").StartSignupChallengeInput) {
+    const active = [...this.authChallenges.values()].find((challenge) => challenge.email === input.email && challenge.purpose === "signup" && !challenge.consumedAt && challenge.expiresAt > input.now);
+    if (active && active.resendAvailableAt > input.now) {
+      return { challengeId: active.id, expiresAt: active.expiresAt, resendAvailableAt: active.resendAvailableAt,
+        shouldSend: false, eligible: Boolean(active.pendingSignupId) && !this.admins.has(input.email) };
+    }
+    for (const challenge of this.authChallenges.values()) if (challenge.email === input.email && challenge.purpose === "signup" && !challenge.consumedAt) challenge.consumedAt = input.now;
+    const challenge: AuthChallenge & { otpHash: string; maxAttempts: number; attempts: number; lockedUntil: Date | null; resetTokenHash: string | null; resetTokenExpiresAt: Date | null; resetConsumedAt: Date | null } = {
+      id: input.challengeId, purpose: "signup", email: input.email, pendingSignupId: null, adminId: null,
+      expiresAt: input.expiresAt, resendAvailableAt: input.resendAvailableAt, consumedAt: null, otpHash: input.otpHash,
+      maxAttempts: input.maxAttempts, attempts: 0, lockedUntil: null, resetTokenHash: null, resetTokenExpiresAt: null, resetConsumedAt: null
+    };
+    if (this.admins.has(input.email)) {
+      this.authChallenges.set(challenge.id, challenge);
+      return { challengeId: challenge.id, expiresAt: challenge.expiresAt, resendAvailableAt: challenge.resendAvailableAt, shouldSend: false, eligible: false };
+    }
+    const existingPending = this.pendingSignups.get(input.email);
+    const pending = !existingPending || existingPending.expiresAt <= input.now
+      ? { id: randomUUID(), workspaceName: input.workspaceName, passwordHash: input.passwordHash, phone: input.phone ?? null, expiresAt: new Date(input.now.getTime() + 24 * 60 * 60 * 1000) }
+      : existingPending;
+    this.pendingSignups.set(input.email, pending);
+    challenge.pendingSignupId = pending.id;
+    this.authChallenges.set(challenge.id, challenge);
+    return { challengeId: challenge.id, expiresAt: challenge.expiresAt, resendAvailableAt: challenge.resendAvailableAt, shouldSend: true, eligible: true };
+  }
+
+  async startPasswordResetChallenge(input: import("../src/types.js").StartPasswordResetChallengeInput) {
+    const active = [...this.authChallenges.values()].find((challenge) => challenge.email === input.email && challenge.purpose === "password_reset" && !challenge.consumedAt && challenge.expiresAt > input.now);
+    if (active && active.resendAvailableAt > input.now) {
+      return { challengeId: active.id, expiresAt: active.expiresAt, resendAvailableAt: active.resendAvailableAt, shouldSend: false, eligible: Boolean(active.adminId) };
+    }
+    for (const challenge of this.authChallenges.values()) if (challenge.email === input.email && challenge.purpose === "password_reset" && !challenge.consumedAt) challenge.consumedAt = input.now;
+    const admin = [...this.admins.values()].find((item) => item.email === input.email && item.role === "tenant");
+    const challenge: AuthChallenge & { otpHash: string; maxAttempts: number; attempts: number; lockedUntil: Date | null; resetTokenHash: string | null; resetTokenExpiresAt: Date | null; resetConsumedAt: Date | null } = {
+      id: input.challengeId, purpose: "password_reset", email: input.email, pendingSignupId: null, adminId: admin?.id ?? null,
+      expiresAt: input.expiresAt, resendAvailableAt: input.resendAvailableAt, consumedAt: null, otpHash: input.otpHash,
+      maxAttempts: input.maxAttempts, attempts: 0, lockedUntil: null, resetTokenHash: null, resetTokenExpiresAt: null, resetConsumedAt: null
+    };
+    this.authChallenges.set(challenge.id, challenge);
+    return { challengeId: challenge.id, expiresAt: challenge.expiresAt, resendAvailableAt: challenge.resendAvailableAt, shouldSend: Boolean(admin), eligible: Boolean(admin) };
+  }
+
+  async getAuthChallenge(challengeId: string) {
+    const challenge = this.authChallenges.get(challengeId);
+    if (!challenge) return null;
+    return { id: challenge.id, purpose: challenge.purpose, email: challenge.email, pendingSignupId: challenge.pendingSignupId,
+      adminId: challenge.adminId, expiresAt: challenge.expiresAt, resendAvailableAt: challenge.resendAvailableAt, consumedAt: challenge.consumedAt };
+  }
+
+  authCheck(challenge: typeof this.authChallenges extends Map<string, infer T> ? T : never, now: Date): import("../src/types.js").VerifyAuthChallengeResult | null {
+    if (challenge.consumedAt) return { status: "invalid", attemptsRemaining: 0, retryAfterSeconds: 0 };
+    if (challenge.lockedUntil && challenge.lockedUntil > now) return { status: "locked", attemptsRemaining: 0, retryAfterSeconds: Math.max(1, Math.ceil((challenge.lockedUntil.getTime() - now.getTime()) / 1000)) };
+    if (challenge.expiresAt <= now) return { status: "expired", attemptsRemaining: 0, retryAfterSeconds: 0 };
+    if (challenge.attempts >= challenge.maxAttempts) {
+      challenge.lockedUntil = new Date(now.getTime() + 900 * 1000);
+      return { status: "locked", attemptsRemaining: 0, retryAfterSeconds: 900 };
+    }
+    return null;
+  }
+
+  authFailure(challenge: typeof this.authChallenges extends Map<string, infer T> ? T : never, now: Date): import("../src/types.js").VerifyAuthChallengeResult {
+    challenge.attempts += 1;
+    const remaining = Math.max(0, challenge.maxAttempts - challenge.attempts);
+    if (remaining === 0) {
+      challenge.lockedUntil = new Date(now.getTime() + 900 * 1000);
+      return { status: "locked", attemptsRemaining: 0, retryAfterSeconds: 900 };
+    }
+    return { status: "invalid", attemptsRemaining: remaining, retryAfterSeconds: 0 };
+  }
+
+  async rotateAuthChallenge(input: { challengeId: string; otpHash: string; expiresAt: Date; resendAvailableAt: Date; now: Date }) {
+    const challenge = this.authChallenges.get(input.challengeId);
+    if (!challenge) return { status: "not_found" as const };
+    if (challenge.consumedAt) return { status: "invalid" as const };
+    if (challenge.lockedUntil && challenge.lockedUntil > input.now) return { status: "locked" as const, retryAfterSeconds: Math.max(1, Math.ceil((challenge.lockedUntil.getTime() - input.now.getTime()) / 1000)) };
+    if (challenge.resendAvailableAt > input.now) return { status: "cooldown" as const, retryAfterSeconds: Math.max(1, Math.ceil((challenge.resendAvailableAt.getTime() - input.now.getTime()) / 1000)) };
+    let shouldSend = false;
+    if (challenge.purpose === "signup" && challenge.pendingSignupId) {
+      const pending = [...this.pendingSignups.values()].find((item) => item.id === challenge.pendingSignupId);
+      if (!pending || pending.expiresAt <= input.now) return { status: "expired" as const };
+      shouldSend = !this.admins.has(challenge.email);
+    } else if (challenge.adminId) {
+      shouldSend = [...this.admins.values()].some((admin) => admin.id === challenge.adminId && admin.role === "tenant");
+    }
+    challenge.otpHash = input.otpHash; challenge.expiresAt = input.expiresAt; challenge.resendAvailableAt = input.resendAvailableAt;
+    challenge.attempts = 0; challenge.lockedUntil = null;
+    return { status: "ok" as const, email: challenge.email, expiresAt: challenge.expiresAt, resendAvailableAt: challenge.resendAvailableAt, shouldSend };
+  }
+
+  async verifySignupChallenge(input: { challengeId: string; otpHash: string; now: Date }) {
+    const challenge = this.authChallenges.get(input.challengeId);
+    if (!challenge || challenge.purpose !== "signup") return { status: "not_found" as const, attemptsRemaining: 0, retryAfterSeconds: 0 };
+    const blocked = this.authCheck(challenge, input.now);
+    if (blocked) return blocked;
+    if (challenge.otpHash !== input.otpHash) return this.authFailure(challenge, input.now);
+    const pending = [...this.pendingSignups.values()].find((item) => item.id === challenge.pendingSignupId);
+    if (!pending || pending.expiresAt <= input.now) return { status: "expired" as const, attemptsRemaining: 0, retryAfterSeconds: 0 };
+    if (this.admins.has(challenge.email)) return { status: "invalid" as const, attemptsRemaining: 0, retryAfterSeconds: 0 };
+    const { tenantId } = await this.createSiteAccount(pending.workspaceName, challenge.email, pending.passwordHash);
+    challenge.consumedAt = input.now; challenge.pendingSignupId = null;
+    this.pendingSignups.delete(challenge.email);
+    return { status: "ok" as const, attemptsRemaining: 0, retryAfterSeconds: 0, tenantId };
+  }
+
+  async verifyPasswordResetChallenge(input: { challengeId: string; otpHash: string; resetTokenHash: string; resetTokenExpiresAt: Date; now: Date }) {
+    const challenge = this.authChallenges.get(input.challengeId);
+    if (!challenge || challenge.purpose !== "password_reset") return { status: "not_found" as const, attemptsRemaining: 0, retryAfterSeconds: 0 };
+    const blocked = this.authCheck(challenge, input.now);
+    if (blocked) return blocked;
+    if (challenge.otpHash !== input.otpHash || !challenge.adminId) return this.authFailure(challenge, input.now);
+    const admin = [...this.admins.values()].find((item) => item.id === challenge.adminId && item.role === "tenant");
+    if (!admin) return this.authFailure(challenge, input.now);
+    challenge.consumedAt = input.now; challenge.resetTokenHash = input.resetTokenHash;
+    challenge.resetTokenExpiresAt = input.resetTokenExpiresAt; challenge.resetConsumedAt = null;
+    return { status: "ok" as const, attemptsRemaining: 0, retryAfterSeconds: 0, email: admin.email, adminId: admin.id };
+  }
+
+  async resetPasswordWithToken(input: { tokenHash: string; passwordHash: string; now: Date }) {
+    const challenge = [...this.authChallenges.values()].find((item) => item.resetTokenHash === input.tokenHash && item.resetTokenExpiresAt && item.resetTokenExpiresAt > input.now && !item.resetConsumedAt && item.consumedAt);
+    if (!challenge?.adminId) return null;
+    const admin = [...this.admins.values()].find((item) => item.id === challenge.adminId);
+    if (!admin) return null;
+    admin.passwordHash = input.passwordHash;
+    for (const [token, id] of this.sessions) if (id === admin.id) this.sessions.delete(token);
+    challenge.resetTokenHash = null; challenge.resetConsumedAt = input.now;
+    return { email: admin.email, adminId: admin.id };
+  }
+
+  async deleteExpiredAuthData(now: Date) {
+    let deleted = 0;
+    for (const [id, challenge] of this.authChallenges) if (challenge.expiresAt < now || (challenge.consumedAt && challenge.consumedAt < now)) { this.authChallenges.delete(id); deleted += 1; }
+    for (const [email, pending] of this.pendingSignups) if (pending.expiresAt < now) { this.pendingSignups.delete(email); deleted += 1; }
+    for (const [key, limit] of this.authRateLimits) if (limit.expiresAt < now) { this.authRateLimits.delete(key); deleted += 1; }
+    return deleted;
+  }
 
   async createSiteAccount(tenantName: string, email: string, passwordHash: string) {
     const tenantId = randomUUID();
@@ -283,8 +443,30 @@ class MemoryStore implements Store {
   async close() {}
 }
 
+function makeApp(store: MemoryStore, appConfig: typeof config = config, now: () => Date = () => new Date()) {
+  return buildApp(appConfig, store, {
+    now,
+    sendAuthEmail: async (message) => { store.authEmails.push(message); }
+  });
+}
+
+function latestCode(store: MemoryStore, email: string, kind: AuthEmailMessage["kind"]) {
+  const message = [...store.authEmails].reverse().find((item) => item.to === email && item.kind === kind);
+  if (!message || !("code" in message)) throw new Error(`Missing ${kind} email for ${email}`);
+  return message.code;
+}
+
+async function completeSignup(app: ReturnType<typeof makeApp>, store: MemoryStore, payload: Record<string, unknown>) {
+  const signup = await app.inject({ method: "POST", url: "/v1/auth/signup", headers: { origin: config.PUBLIC_BASE_URL }, payload });
+  expect(signup.statusCode).toBe(202);
+  const verify = await app.inject({ method: "POST", url: "/v1/auth/signup/verify", headers: { origin: config.PUBLIC_BASE_URL },
+    payload: { challengeId: signup.json().challengeId, code: latestCode(store, String(payload.email), "signup_code") } });
+  expect(verify.statusCode).toBe(200);
+  return { signup, verify };
+}
+
 async function createTestForm(store: MemoryStore) {
-  const app = buildApp(config, store);
+  const app = makeApp(store);
   const response = await app.inject({
     method: "POST",
     url: "/v1/admin/forms",
@@ -315,7 +497,7 @@ async function createTestForm(store: MemoryStore) {
 
 describe("contact form API", () => {
   it("returns retry metadata and shares normalized account locks across portals", async () => {
-    const store = new MemoryStore(); const app = buildApp(config, store);
+    const store = new MemoryStore(); const app = makeApp(store);
     const headers = { origin: config.PUBLIC_BASE_URL };
     for (let i = 0; i < 5; i++) await app.inject({ method: "POST", url: "/v1/admin/login", headers, payload: { email: "USER@example.com", password: "wrong", portal: "tenant" } });
     const locked = await app.inject({ method: "POST", url: "/v1/admin/login", headers, payload: { email: " user@example.com ", password: "wrong", portal: "admin" } });
@@ -326,11 +508,11 @@ describe("contact form API", () => {
     await app.close();
   });
   it("rate-limits a targeted login without locking out other accounts behind the frontend proxy", async () => {
-    const store = new MemoryStore(); const app = buildApp(config, store);
+    const store = new MemoryStore(); const app = makeApp(store);
     const headers = { origin: config.PUBLIC_BASE_URL };
     for (let i = 0; i < 4; i++) expect((await app.inject({ method: "POST", url: "/v1/admin/login", headers, payload: { email: "target@example.com", password: "incorrect" } })).statusCode).toBe(401);
     expect((await app.inject({ method: "POST", url: "/v1/admin/login", headers, payload: { email: "target@example.com", password: "incorrect" } })).statusCode).toBe(429);
-    expect((await app.inject({ method: "POST", url: "/v1/auth/signup", headers, payload: { workspaceName: "Other studio", email: "other@example.com", password: "long-valid-password" } })).statusCode).toBe(202);
+    await completeSignup(app, store, { workspaceName: "Other studio", email: "other@example.com", password: "long-valid-password" });
     expect((await app.inject({ method: "POST", url: "/v1/admin/login", headers, payload: { email: "other@example.com", password: "long-valid-password" } })).statusCode).toBe(200);
     await app.close();
   });
@@ -357,7 +539,7 @@ describe("contact form API", () => {
   });
 
   it("creates tenant accounts and revokes their sessions on password reset", async () => {
-    const store = new MemoryStore(); const app = buildApp(config, store);
+    const store = new MemoryStore(); const app = makeApp(store);
     const service = { authorization: `Bearer ${config.ADMIN_API_KEY}` };
     const created = await app.inject({ method: "POST", url: "/v1/admin/tenants", headers: service, payload: { name: "Studio", email: "owner@example.com", password: "original-password" } });
     expect(created.statusCode).toBe(201);
@@ -394,10 +576,8 @@ describe("contact form API", () => {
 
   it("lets tenant admins edit their forms and enforces their form allowance", async () => {
     const store = new MemoryStore();
-    const app = buildApp(config, store);
-    const signup = await app.inject({ method: "POST", url: "/v1/auth/signup", headers: { origin: config.PUBLIC_BASE_URL },
-      payload: { workspaceName: "Limited Studio", email: "limited@studio.test", password: "a-secure-password" } });
-    expect(signup.statusCode).toBe(202);
+    const app = makeApp(store);
+    await completeSignup(app, store, { workspaceName: "Limited Studio", email: "limited@studio.test", password: "a-secure-password" });
     const tenantId = (await store.getAdminByEmail("limited@studio.test"))?.tenantId as string;
     await store.updateTenantLimits(tenantId, { maxOriginsPerForm: 2, maxForms: 1, maxTotalSubmissions: 10, maxDailySubmissions: 5 });
     const login = await app.inject({ method: "POST", url: "/v1/admin/login", headers: { origin: config.PUBLIC_BASE_URL },
@@ -426,10 +606,8 @@ describe("contact form API", () => {
 
   it("allows super admins, but not tenant admins, to change tenant permissions", async () => {
     const store = new MemoryStore();
-    const app = buildApp(config, store);
-    const signup = await app.inject({ method: "POST", url: "/v1/auth/signup", headers: { origin: config.PUBLIC_BASE_URL },
-      payload: { workspaceName: "Managed Studio", email: "tenant@studio.test", password: "a-secure-password" } });
-    expect(signup.statusCode).toBe(202);
+    const app = makeApp(store);
+    await completeSignup(app, store, { workspaceName: "Managed Studio", email: "tenant@studio.test", password: "a-secure-password" });
     const tenantId = (await store.getAdminByEmail("tenant@studio.test"))?.tenantId as string;
     await app.inject({ method: "POST", url: "/v1/admin/users", headers: { authorization: `Bearer ${config.ADMIN_API_KEY}` },
       payload: { email: "super@example.com", password: "a-long-super-password", role: "super" } });
@@ -450,7 +628,7 @@ describe("contact form API", () => {
 
   it("normalizes trailing slashes in allowed origins but rejects URL paths", async () => {
     const store = new MemoryStore();
-    const app = buildApp(config, store);
+    const app = makeApp(store);
     const valid = await app.inject({
       method: "POST",
       url: "/v1/admin/forms",
@@ -480,7 +658,7 @@ describe("contact form API", () => {
   });
 
   it("manages integrations without exposing secrets and preserves credentials on edits", async () => {
-    const store = new MemoryStore(); const app = buildApp(config, store);
+    const store = new MemoryStore(); const app = makeApp(store);
     const headers = { authorization: `Bearer ${config.ADMIN_API_KEY}` };
     const created = await app.inject({ method: "POST", url: "/v1/admin/forms", headers, payload: {
       tenantName: "Studio", name: "Contact", allowedOrigins: ["https://example.com"], schema: { type: "object", properties: { name: { type: "string" } } },
@@ -499,8 +677,7 @@ describe("contact form API", () => {
     const publicForm = await app.inject({ url: `/v1/forms/${created.json().publicKey}`, headers: { origin: "https://example.com" } });
     expect(publicForm.body).not.toContain("destinations");
     expect(publicForm.body).not.toContain("/123/token");
-    const signup = await app.inject({ method: "POST", url: "/v1/auth/signup", headers: { origin: config.PUBLIC_BASE_URL }, payload: { workspaceName: "Other", email: "integrations@example.com", password: "integration-password" } });
-    expect(signup.statusCode).toBe(202);
+    await completeSignup(app, store, { workspaceName: "Other", email: "integrations@example.com", password: "integration-password" });
     const login = await app.inject({ method: "POST", url: "/v1/admin/login", headers: { origin: config.PUBLIC_BASE_URL }, payload: { email: "integrations@example.com", password: "integration-password" } });
     expect((await app.inject({ url: `${path}/destinations`, headers: { cookie: login.headers["set-cookie"] as string } })).statusCode).toBe(404);
     for (const endpoint of ["test", "replies", "replies/preview"]) {
@@ -540,15 +717,9 @@ describe("contact form API", () => {
   });
   it("signs up a customer workspace and lets its owner create forms", async () => {
     const store = new MemoryStore();
-    const app = buildApp(config, store);
-    const signup = await app.inject({
-      method: "POST",
-      url: "/v1/auth/signup",
-      headers: { origin: config.PUBLIC_BASE_URL },
-      payload: { workspaceName: "New Studio", email: "owner@studio.test", password: "a-secure-password" }
-    });
-    expect(signup.statusCode).toBe(202);
-    expect(signup.json()).toEqual({ message: "If this address can be registered, workspace setup will continue." });
+    const app = makeApp(store);
+    const { signup } = await completeSignup(app, store, { workspaceName: "New Studio", email: "owner@studio.test", password: "a-secure-password" });
+    expect(signup.json()).toMatchObject({ message: "We've received your request. If the email is eligible, you will receive a verification code shortly." });
     const tenantId = (await store.getAdminByEmail("owner@studio.test"))?.tenantId;
     expect(store.tenants.get(tenantId!)?.name).toBe("new-studio");
 
@@ -842,7 +1013,7 @@ describe("contact form API", () => {
   it("requires bot verification when Turnstile is configured", async () => {
     const store = new MemoryStore();
     const secureConfig = { ...config, TURNSTILE_SECRET_KEY: "test-secret" };
-    const app = buildApp(secureConfig, store);
+    const app = makeApp(store, secureConfig);
     const create = await app.inject({
       method: "POST",
       url: "/v1/admin/forms",
@@ -881,9 +1052,163 @@ describe("contact form API", () => {
 });
 
 
+describe("email-verified auth", () => {
+  it("keeps signup pending until the correct code is verified", async () => {
+    const store = new MemoryStore(); const app = makeApp(store);
+    const payload = { workspaceName: "Secure Studio", email: "secure@studio.test", password: "a-secure-password" };
+    const signup = await app.inject({ method: "POST", url: "/v1/auth/signup", headers: { origin: config.PUBLIC_BASE_URL }, payload });
+    expect(signup.statusCode).toBe(202);
+    expect(signup.json()).toMatchObject({ message: "We've received your request. If the email is eligible, you will receive a verification code shortly." });
+    expect(await store.getAdminByEmail(payload.email)).toBeNull();
+    expect(store.pendingSignups.size).toBe(1);
+    expect(store.authEmails.filter((message) => message.kind === "signup_code")).toHaveLength(1);
+    const challenge = [...store.authChallenges.values()][0];
+    const code = latestCode(store, payload.email, "signup_code");
+    expect(challenge.otpHash).not.toContain(code);
+    expect(JSON.stringify(challenge)).not.toContain(payload.password);
+
+    const wrong = code === "000000" ? "000001" : "000000";
+    const invalid = await app.inject({ method: "POST", url: "/v1/auth/signup/verify", headers: { origin: config.PUBLIC_BASE_URL }, payload: { challengeId: signup.json().challengeId, code: wrong } });
+    expect(invalid.statusCode).toBe(400);
+    expect(invalid.json()).toMatchObject({ code: "OTP_INVALID", attemptsRemaining: 4 });
+    const cooldown = await app.inject({ method: "POST", url: "/v1/auth/signup/resend", headers: { origin: config.PUBLIC_BASE_URL }, payload: { challengeId: signup.json().challengeId } });
+    expect(cooldown.statusCode).toBe(429);
+
+    const verify = await app.inject({ method: "POST", url: "/v1/auth/signup/verify", headers: { origin: config.PUBLIC_BASE_URL }, payload: { challengeId: signup.json().challengeId, code } });
+    expect(verify.statusCode).toBe(200);
+    expect(store.pendingSignups.size).toBe(0);
+    expect(await store.getAdminByEmail(payload.email)).toMatchObject({ role: "tenant" });
+    const replay = await app.inject({ method: "POST", url: "/v1/auth/signup/verify", headers: { origin: config.PUBLIC_BASE_URL }, payload: { challengeId: signup.json().challengeId, code } });
+    expect(replay.statusCode).toBe(400);
+    expect((await app.inject({ method: "POST", url: "/v1/admin/login", headers: { origin: config.PUBLIC_BASE_URL }, payload: { email: payload.email, password: payload.password } })).statusCode).toBe(200);
+    await app.close();
+  });
+
+  it("returns the same signup response without sending a code for an existing account", async () => {
+    const store = new MemoryStore(); const app = makeApp(store);
+    await completeSignup(app, store, { workspaceName: "Existing Studio", email: "existing@studio.test", password: "a-secure-password" });
+    const before = store.authEmails.length;
+    const response = await app.inject({ method: "POST", url: "/v1/auth/signup", headers: { origin: config.PUBLIC_BASE_URL },
+      payload: { workspaceName: "Different Studio", email: "existing@studio.test", password: "different-password" } });
+    expect(response.statusCode).toBe(202);
+    expect(response.json().message).toBe("We've received your request. If the email is eligible, you will receive a verification code shortly.");
+    expect(store.authEmails).toHaveLength(before);
+    expect((await app.inject({ method: "POST", url: "/v1/admin/login", headers: { origin: config.PUBLIC_BASE_URL }, payload: { email: "existing@studio.test", password: "a-secure-password" } })).statusCode).toBe(200);
+    expect((await app.inject({ method: "POST", url: "/v1/admin/login", headers: { origin: config.PUBLIC_BASE_URL }, payload: { email: "existing@studio.test", password: "different-password" } })).statusCode).toBe(401);
+    await app.close();
+  });
+
+  it("rotates expired signup codes, invalidates old codes, and resends after the cooldown", async () => {
+    let clock = new Date("2026-01-01T00:00:00Z");
+    const store = new MemoryStore(); const app = makeApp(store, config, () => clock);
+    const payload = { workspaceName: "Timed Studio", email: "timed@studio.test", password: "a-secure-password" };
+    const signup = await app.inject({ method: "POST", url: "/v1/auth/signup", headers: { origin: config.PUBLIC_BASE_URL }, payload });
+    const challengeId = signup.json().challengeId as string;
+    const firstCode = latestCode(store, payload.email, "signup_code");
+    clock = new Date(clock.getTime() + 61_000);
+    const resend = await app.inject({ method: "POST", url: "/v1/auth/signup/resend", headers: { origin: config.PUBLIC_BASE_URL }, payload: { challengeId } });
+    expect(resend.statusCode).toBe(202);
+    const secondCode = latestCode(store, payload.email, "signup_code");
+    expect(secondCode).not.toBe(firstCode);
+    expect((await app.inject({ method: "POST", url: "/v1/auth/signup/verify", headers: { origin: config.PUBLIC_BASE_URL }, payload: { challengeId, code: firstCode } })).statusCode).toBe(400);
+    expect((await app.inject({ method: "POST", url: "/v1/auth/signup/verify", headers: { origin: config.PUBLIC_BASE_URL }, payload: { challengeId, code: secondCode } })).statusCode).toBe(200);
+
+    const other = await app.inject({ method: "POST", url: "/v1/auth/signup", headers: { origin: config.PUBLIC_BASE_URL },
+      payload: { workspaceName: "Expired Studio", email: "expired@studio.test", password: "a-secure-password" } });
+    clock = new Date(clock.getTime() + 301_000);
+    const expired = await app.inject({ method: "POST", url: "/v1/auth/signup/verify", headers: { origin: config.PUBLIC_BASE_URL },
+      payload: { challengeId: other.json().challengeId, code: latestCode(store, "expired@studio.test", "signup_code") } });
+    expect(expired.statusCode).toBe(400);
+    expect(expired.json().code).toBe("OTP_EXPIRED");
+    await app.close();
+  });
+
+  it("locks a code after five incorrect attempts and then resets password with a single-use token", async () => {
+    let clock = new Date("2026-01-01T00:00:00Z");
+    const store = new MemoryStore(); const app = makeApp(store, config, () => clock);
+    await completeSignup(app, store, { workspaceName: "Reset Studio", email: "reset@studio.test", password: "old-password" });
+    const login = await app.inject({ method: "POST", url: "/v1/admin/login", headers: { origin: config.PUBLIC_BASE_URL }, payload: { email: "reset@studio.test", password: "old-password" } });
+    const oldCookie = login.headers["set-cookie"] as string;
+
+    const forgot = await app.inject({ method: "POST", url: "/v1/auth/forgot-password", headers: { origin: config.PUBLIC_BASE_URL }, payload: { email: "reset@studio.test" } });
+    expect(forgot.statusCode).toBe(202);
+    const challengeId = forgot.json().challengeId as string;
+    const code = latestCode(store, "reset@studio.test", "password_reset_code");
+    const wrong = code === "000000" ? "000001" : "000000";
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      const response = await app.inject({ method: "POST", url: "/v1/auth/forgot-password/verify", headers: { origin: config.PUBLIC_BASE_URL }, payload: { challengeId, code: wrong } });
+      expect(response.statusCode).toBe(400);
+      expect(response.json().attemptsRemaining).toBe(5 - attempt);
+    }
+    const locked = await app.inject({ method: "POST", url: "/v1/auth/forgot-password/verify", headers: { origin: config.PUBLIC_BASE_URL }, payload: { challengeId, code: wrong } });
+    expect(locked.statusCode).toBe(429);
+    expect(locked.json().code).toBe("OTP_LOCKED");
+
+    clock = new Date(clock.getTime() + 61_000);
+    const secondForgot = await app.inject({ method: "POST", url: "/v1/auth/forgot-password", headers: { origin: config.PUBLIC_BASE_URL }, payload: { email: "reset@studio.test" } });
+    expect(secondForgot.statusCode).toBe(202);
+    const secondId = secondForgot.json().challengeId as string;
+    const secondCode = latestCode(store, "reset@studio.test", "password_reset_code");
+    const verified = await app.inject({ method: "POST", url: "/v1/auth/forgot-password/verify", headers: { origin: config.PUBLIC_BASE_URL }, payload: { challengeId: secondId, code: secondCode } });
+    expect(verified.statusCode).toBe(200);
+    expect(verified.json().token).toBe(verified.json().resetToken);
+    const resetToken = verified.json().token as string;
+
+    const reset = await app.inject({ method: "POST", url: "/v1/auth/reset-password", headers: { origin: config.PUBLIC_BASE_URL }, payload: { token: resetToken, password: "new-password", confirmPassword: "new-password" } });
+    expect(reset.statusCode).toBe(200);
+    expect(store.authEmails.some((message) => message.kind === "password_changed" && message.to === "reset@studio.test")).toBe(true);
+    expect((await app.inject({ url: "/v1/admin/me", headers: { cookie: oldCookie } })).statusCode).toBe(401);
+    expect((await app.inject({ method: "POST", url: "/v1/admin/login", headers: { origin: config.PUBLIC_BASE_URL }, payload: { email: "reset@studio.test", password: "old-password" } })).statusCode).toBe(401);
+    expect((await app.inject({ method: "POST", url: "/v1/admin/login", headers: { origin: config.PUBLIC_BASE_URL }, payload: { email: "reset@studio.test", password: "new-password" } })).statusCode).toBe(200);
+    expect((await app.inject({ method: "POST", url: "/v1/auth/reset-password", headers: { origin: config.PUBLIC_BASE_URL }, payload: { token: resetToken, password: "third-password" } })).statusCode).toBe(400);
+    await app.close();
+  });
+
+  it("uses a decoy reset challenge for unknown emails without sending mail", async () => {
+    const store = new MemoryStore(); const app = makeApp(store);
+    const response = await app.inject({ method: "POST", url: "/v1/auth/forgot-password", headers: { origin: config.PUBLIC_BASE_URL }, payload: { email: "missing@studio.test" } });
+    expect(response.statusCode).toBe(202);
+    expect(store.authEmails).toEqual([]);
+    expect(store.authChallenges.size).toBe(1);
+    const wrong = await app.inject({ method: "POST", url: "/v1/auth/forgot-password/verify", headers: { origin: config.PUBLIC_BASE_URL }, payload: { challengeId: response.json().challengeId, code: "123456" } });
+    expect(wrong.statusCode).toBe(400);
+    await app.close();
+  });
+
+  it("rate-limits signup attempts per client before creating more pending accounts", async () => {
+    const store = new MemoryStore(); const app = makeApp(store);
+    for (let index = 0; index < 5; index++) {
+      const response = await app.inject({ method: "POST", url: "/v1/auth/signup", headers: { origin: config.PUBLIC_BASE_URL },
+        payload: { workspaceName: `Studio ${index}`, email: `limited${index}@studio.test`, password: "a-secure-password" } });
+      expect(response.statusCode).toBe(202);
+    }
+    const limited = await app.inject({ method: "POST", url: "/v1/auth/signup", headers: { origin: config.PUBLIC_BASE_URL },
+      payload: { workspaceName: "One More", email: "limited-five@studio.test", password: "a-secure-password" } });
+    expect(limited.statusCode).toBe(429);
+    expect(limited.headers["retry-after"]).toBeDefined();
+    expect(store.pendingSignups.size).toBe(5);
+    await app.close();
+  });
+
+  it("expires reset tokens and rejects malformed or weak reset passwords", async () => {
+    let clock = new Date("2026-01-01T00:00:00Z");
+    const store = new MemoryStore(); const app = makeApp(store, config, () => clock);
+    await completeSignup(app, store, { workspaceName: "Token Studio", email: "token@studio.test", password: "old-password" });
+    const forgot = await app.inject({ method: "POST", url: "/v1/auth/forgot-password", headers: { origin: config.PUBLIC_BASE_URL }, payload: { email: "token@studio.test" } });
+    const challengeId = forgot.json().challengeId as string;
+    const code = latestCode(store, "token@studio.test", "password_reset_code");
+    const verified = await app.inject({ method: "POST", url: "/v1/auth/forgot-password/verify", headers: { origin: config.PUBLIC_BASE_URL }, payload: { challengeId, code } });
+    const token = verified.json().token as string;
+    expect((await app.inject({ method: "POST", url: "/v1/auth/reset-password", headers: { origin: config.PUBLIC_BASE_URL }, payload: { token, password: "short" } })).statusCode).toBe(422);
+    clock = new Date(clock.getTime() + 601_000);
+    expect((await app.inject({ method: "POST", url: "/v1/auth/reset-password", headers: { origin: config.PUBLIC_BASE_URL }, payload: { token, password: "new-password" } })).statusCode).toBe(400);
+    await app.close();
+  });
+});
+
 describe("website contact inbox", () => {
   it("accepts messages without a tenant form, deduplicates retries, and rejects invalid/spam input", async () => {
-    const store = new MemoryStore(); const app = buildApp(config, store);
+    const store = new MemoryStore(); const app = makeApp(store);
     try {
       const headers = { origin: config.PUBLIC_BASE_URL, "idempotency-key": randomUUID() };
       const payload = { name: "Alex", email: "alex@example.com", message: "Please help me get started.", _website: "" };
@@ -897,7 +1222,7 @@ describe("website contact inbox", () => {
     } finally { await app.close(); }
   });
   it("permits only super/sudo admins to read and delete messages, with pagination and origin checks", async () => {
-    const store = new MemoryStore(); const app = buildApp(config, store);
+    const store = new MemoryStore(); const app = makeApp(store);
     const { hashSessionToken } = await import("../src/admin-auth.js");
     try {
       await store.saveSiteContact({ name: "Private", email: "private@example.com", message: "An admin-only message" }, randomUUID());
@@ -926,7 +1251,7 @@ describe("website contact inbox", () => {
     } finally { await app.close(); }
   });
   it("rate limits website messages", async () => {
-    const app = buildApp({ ...config, RATE_LIMIT_MAX: 1 }, new MemoryStore());
+    const app = makeApp(new MemoryStore(), { ...config, RATE_LIMIT_MAX: 1 });
     try {
       const request = { method: "POST" as const, url: "/v1/site-contact", headers: { origin: config.PUBLIC_BASE_URL, "idempotency-key": randomUUID() }, payload: { name: "Alex", email: "alex@example.com", message: "Please help me get started." } };
       expect((await app.inject(request)).statusCode).toBe(202);

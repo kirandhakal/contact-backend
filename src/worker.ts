@@ -10,6 +10,7 @@ async function tick() {
   const now = Date.now();
   if (now - lastCleanup > 24 * 60 * 60 * 1000) {
     await store.deleteExpiredSubmissions(new Date());
+    await store.deleteExpiredAuthData(new Date());
     lastCleanup = now;
   }
 

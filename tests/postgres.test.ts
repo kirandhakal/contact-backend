@@ -43,7 +43,8 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)("PostgreSQL management integrati
   it("reproduces login failure without the lockout migration and repairs signup/login by migrating", async () => {
     const config = getConfig({ NODE_ENV: "test", DATABASE_URL: pool.options.connectionString!,
       ADMIN_API_KEY: "test-admin-key-at-least-24-characters", DATA_ENCRYPTION_KEY: "a".repeat(64), PUBLIC_BASE_URL: "http://localhost:3100" });
-    const app = buildApp(config, store);
+    const messages: import("../src/auth-email.js").AuthEmailMessage[] = [];
+    const app = buildApp(config, store, { sendAuthEmail: async (message) => { messages.push(message); } });
     const headers = { origin: config.PUBLIC_BASE_URL };
     const email = `${randomUUID()}@example.com`;
     const credentials = { email, password: "signup-test-password", portal: "tenant" };
@@ -51,6 +52,10 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)("PostgreSQL management integrati
       await pool.query("DROP TABLE login_lockouts");
       const signup = await app.inject({ method: "POST", url: "/v1/auth/signup", headers, payload: { workspaceName: "Café & Company", email, password: credentials.password } });
       expect(signup.statusCode).toBe(202);
+      const code = messages.find(message => message.to === email && message.kind === "signup_code");
+      if (!code || !("code" in code)) throw new Error("Signup code was not created");
+      const verify = await app.inject({ method: "POST", url: "/v1/auth/signup/verify", headers, payload: { challengeId: signup.json().challengeId, code: code.code } });
+      expect(verify.statusCode).toBe(200);
       expect((await app.inject({ method: "POST", url: "/v1/admin/login", headers, payload: credentials })).statusCode).toBe(500);
       await migrateDatabase(pool.options.connectionString!);
       const login = await app.inject({ method: "POST", url: "/v1/admin/login", headers, payload: credentials });

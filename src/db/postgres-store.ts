@@ -1,4 +1,5 @@
 import { publicDeliveryError } from "../delivery-errors.js";
+import { otpMatches } from "../auth-otp.js";
 import pg from "pg";
 import { encryptDestination, decryptDestination } from "../integrations.js";
 import { formSlug, tenantSlug } from "../tenant-name.js";
@@ -19,7 +20,13 @@ import type {
   SubmissionStatus,
   TenantLimits,
   TenantSummary,
-  TenantUsage
+  TenantUsage,
+  StartSignupChallengeInput,
+  StartPasswordResetChallengeInput,
+  AuthChallenge,
+  AuthChallengeResult,
+  RotateAuthChallengeResult,
+  VerifyAuthChallengeResult
 } from "../types.js";
 
 const { Pool } = pg;
@@ -130,6 +137,320 @@ export class PostgresStore implements Store {
       client.release();
     }
   }
+  async checkAuthRateLimit(key: string, windowSeconds: number, max: number, now: Date) {
+    const result = await this.pool.query(
+      `insert into auth_rate_limits(key, window_started_at, count, expires_at)
+       values($1, $4, 1, $4 + ($3 * interval '1 second'))
+       on conflict (key) do update set
+         count = case when auth_rate_limits.expires_at <= $4 then 1 else auth_rate_limits.count + 1 end,
+         window_started_at = case when auth_rate_limits.expires_at <= $4 then $4 else auth_rate_limits.window_started_at end,
+         expires_at = case when auth_rate_limits.expires_at <= $4 then $4 + ($3 * interval '1 second') else auth_rate_limits.expires_at end
+       returning count, expires_at`,
+      [key, windowSeconds, windowSeconds, now]
+    );
+    const row = result.rows[0];
+    const allowed = Number(row.count) <= max;
+    return {
+      allowed,
+      retryAfterSeconds: allowed ? 0 : Math.max(1, Math.ceil((new Date(row.expires_at).getTime() - now.getTime()) / 1000))
+    };
+  }
+
+  async startSignupChallenge(input: StartSignupChallengeInput): Promise<AuthChallengeResult> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("begin");
+      await client.query("select pg_advisory_xact_lock(hashtextextended($1,0))", [`signup:${input.email}`]);
+      const active = await client.query(
+        `select * from auth_challenges
+         where email=$1 and purpose='signup' and consumed_at is null and expires_at > $2
+         order by created_at desc limit 1 for update`,
+        [input.email, input.now]
+      );
+      if (active.rowCount && new Date(active.rows[0].resend_available_at) > input.now) {
+        const row = active.rows[0];
+        const eligible = Boolean(row.pending_signup_id) && !(await client.query("select 1 from admin_users where email=$1", [input.email])).rowCount;
+        await client.query("commit");
+        return { challengeId: row.id, expiresAt: new Date(row.expires_at), resendAvailableAt: new Date(row.resend_available_at), shouldSend: false, eligible };
+      }
+
+      await client.query("update auth_challenges set consumed_at=$2 where email=$1 and purpose='signup' and consumed_at is null", [input.email, input.now]);
+      const existing = await client.query("select id from admin_users where email=$1", [input.email]);
+      if (existing.rowCount) {
+        await client.query(
+          `insert into auth_challenges(id,purpose,email,otp_hash,expires_at,resend_available_at,max_attempts)
+           values($1,'signup',$2,$3,$4,$5,$6)`,
+          [input.challengeId, input.email, input.otpHash, input.expiresAt, input.resendAvailableAt, input.maxAttempts]
+        );
+        await client.query("commit");
+        return { challengeId: input.challengeId, expiresAt: input.expiresAt, resendAvailableAt: input.resendAvailableAt, shouldSend: false, eligible: false };
+      }
+
+      const pending = await client.query("select id, expires_at from pending_signups where email=$1 for update", [input.email]);
+      let pendingId: string;
+      if (!pending.rowCount) {
+        const inserted = await client.query(
+          `insert into pending_signups(email,workspace_name,password_hash,phone,expires_at)
+           values($1,$2,$3,$4,$5) returning id`,
+          [input.email, input.workspaceName, input.passwordHash, input.phone ?? null, new Date(input.now.getTime() + 24 * 60 * 60 * 1000)]
+        );
+        pendingId = inserted.rows[0].id;
+      } else if (new Date(pending.rows[0].expires_at) <= input.now) {
+        await client.query(
+          "update pending_signups set workspace_name=$2,password_hash=$3,phone=$4,expires_at=$5,created_at=$6 where id=$1",
+          [pending.rows[0].id, input.workspaceName, input.passwordHash, input.phone ?? null, new Date(input.now.getTime() + 24 * 60 * 60 * 1000), input.now]
+        );
+        pendingId = pending.rows[0].id;
+      } else {
+        pendingId = pending.rows[0].id;
+      }
+
+      await client.query(
+        `insert into auth_challenges(id,purpose,email,pending_signup_id,otp_hash,expires_at,resend_available_at,max_attempts)
+         values($1,'signup',$2,$3,$4,$5,$6,$7)`,
+        [input.challengeId, input.email, pendingId, input.otpHash, input.expiresAt, input.resendAvailableAt, input.maxAttempts]
+      );
+      await client.query("commit");
+      return { challengeId: input.challengeId, expiresAt: input.expiresAt, resendAvailableAt: input.resendAvailableAt, shouldSend: true, eligible: true };
+    } catch (error) {
+      await client.query("rollback");
+      throw error;
+    } finally { client.release(); }
+  }
+
+  async startPasswordResetChallenge(input: StartPasswordResetChallengeInput): Promise<AuthChallengeResult> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("begin");
+      await client.query("select pg_advisory_xact_lock(hashtextextended($1,0))", [`password_reset:${input.email}`]);
+      const active = await client.query(
+        `select * from auth_challenges
+         where email=$1 and purpose='password_reset' and consumed_at is null and expires_at > $2
+         order by created_at desc limit 1 for update`,
+        [input.email, input.now]
+      );
+      if (active.rowCount && new Date(active.rows[0].resend_available_at) > input.now) {
+        const row = active.rows[0];
+        await client.query("commit");
+        return { challengeId: row.id, expiresAt: new Date(row.expires_at), resendAvailableAt: new Date(row.resend_available_at), shouldSend: false, eligible: Boolean(row.admin_id) };
+      }
+      await client.query("update auth_challenges set consumed_at=$2 where email=$1 and purpose='password_reset' and consumed_at is null", [input.email, input.now]);
+      const admin = await client.query("select id from admin_users where email=$1 and role='tenant'", [input.email]);
+      const adminId = admin.rowCount ? admin.rows[0].id as string : null;
+      await client.query(
+        `insert into auth_challenges(id,purpose,email,admin_id,otp_hash,expires_at,resend_available_at,max_attempts)
+         values($1,'password_reset',$2,$3,$4,$5,$6,$7)`,
+        [input.challengeId, input.email, adminId, input.otpHash, input.expiresAt, input.resendAvailableAt, input.maxAttempts]
+      );
+      await client.query("commit");
+      return { challengeId: input.challengeId, expiresAt: input.expiresAt, resendAvailableAt: input.resendAvailableAt, shouldSend: Boolean(adminId), eligible: Boolean(adminId) };
+    } catch (error) {
+      await client.query("rollback");
+      throw error;
+    } finally { client.release(); }
+  }
+
+  async getAuthChallenge(challengeId: string): Promise<AuthChallenge | null> {
+    const result = await this.pool.query(
+      "select id,purpose,email,pending_signup_id,admin_id,expires_at,resend_available_at,consumed_at from auth_challenges where id=$1",
+      [challengeId]
+    );
+    if (!result.rowCount) return null;
+    const row = result.rows[0];
+    return {
+      id: row.id, purpose: row.purpose, email: row.email, pendingSignupId: row.pending_signup_id,
+      adminId: row.admin_id, expiresAt: new Date(row.expires_at), resendAvailableAt: new Date(row.resend_available_at),
+      consumedAt: row.consumed_at ? new Date(row.consumed_at) : null
+    };
+  }
+
+  async rotateAuthChallenge(input: { challengeId: string; otpHash: string; expiresAt: Date; resendAvailableAt: Date; now: Date }): Promise<RotateAuthChallengeResult> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("begin");
+      const result = await client.query("select * from auth_challenges where id=$1 for update", [input.challengeId]);
+      if (!result.rowCount) { await client.query("rollback"); return { status: "not_found" }; }
+      const row = result.rows[0];
+      if (row.consumed_at) { await client.query("rollback"); return { status: "invalid" }; }
+      if (row.locked_until && new Date(row.locked_until) > input.now) {
+        await client.query("rollback");
+        return { status: "locked", retryAfterSeconds: Math.max(1, Math.ceil((new Date(row.locked_until).getTime() - input.now.getTime()) / 1000)) };
+      }
+      if (new Date(row.resend_available_at) > input.now) {
+        await client.query("rollback");
+        return { status: "cooldown", retryAfterSeconds: Math.max(1, Math.ceil((new Date(row.resend_available_at).getTime() - input.now.getTime()) / 1000)) };
+      }
+      let shouldSend = false;
+      if (row.purpose === "signup") {
+        if (row.pending_signup_id) {
+          const pending = await client.query("select expires_at from pending_signups where id=$1", [row.pending_signup_id]);
+          if (!pending.rowCount || new Date(pending.rows[0].expires_at) <= input.now) { await client.query("rollback"); return { status: "expired" }; }
+          shouldSend = !(await client.query("select 1 from admin_users where email=$1", [row.email])).rowCount;
+        }
+      } else if (row.admin_id) {
+        const admin = await client.query("select 1 from admin_users where id=$1 and role='tenant'", [row.admin_id]);
+        shouldSend = Boolean(admin.rowCount);
+      }
+      await client.query(
+        `update auth_challenges set otp_hash=$2,expires_at=$3,resend_available_at=$4,attempts=0,locked_until=null
+         where id=$1`,
+        [row.id, input.otpHash, input.expiresAt, input.resendAvailableAt]
+      );
+      await client.query("commit");
+      return { status: "ok", email: row.email, expiresAt: input.expiresAt, resendAvailableAt: input.resendAvailableAt, shouldSend };
+    } catch (error) {
+      await client.query("rollback");
+      throw error;
+    } finally { client.release(); }
+  }
+
+  async verifySignupChallenge(input: { challengeId: string; otpHash: string; now: Date }): Promise<VerifyAuthChallengeResult> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("begin");
+      const result = await client.query(
+        `select c.*, p.workspace_name, p.password_hash, p.phone, p.expires_at as pending_expires_at
+         from auth_challenges c left join pending_signups p on p.id=c.pending_signup_id
+         where c.id=$1 and c.purpose='signup' for update of c`,
+        [input.challengeId]
+      );
+      if (!result.rowCount) { await client.query("rollback"); return { status: "not_found", attemptsRemaining: 0, retryAfterSeconds: 0 }; }
+      const row = result.rows[0];
+      const check = await this.checkChallengeForVerification(client, row, input.now);
+      if (check) { await client.query(check.commit ? "commit" : "rollback"); return check.result; }
+      if (!otpMatches(row.otp_hash, input.otpHash)) {
+        const failure = await this.recordChallengeFailure(client, row, input.now);
+        await client.query("commit");
+        return failure;
+      }
+      if (!row.pending_signup_id || !row.workspace_name || !row.password_hash || new Date(row.pending_expires_at) <= input.now) {
+        await client.query("rollback");
+        return { status: "expired", attemptsRemaining: 0, retryAfterSeconds: 0 };
+      }
+      try {
+        const tenant = await client.query("insert into tenants(name) values($1) returning id", [tenantSlug(row.workspace_name)]);
+        await client.query(
+          "insert into admin_users(email,password_hash,role,tenant_id) values($1,$2,'tenant',$3)",
+          [row.email, row.password_hash, tenant.rows[0].id]
+        );
+        await client.query("update auth_challenges set consumed_at=$2, pending_signup_id=null where id=$1", [row.id, input.now]);
+        await client.query("delete from pending_signups where id=$1", [row.pending_signup_id]);
+        await client.query("commit");
+        return { status: "ok", attemptsRemaining: 0, retryAfterSeconds: 0, tenantId: tenant.rows[0].id as string };
+      } catch (error) {
+        await client.query("rollback");
+        if (typeof error === "object" && error && "code" in error && error.code === "23505") {
+          return { status: "invalid", attemptsRemaining: 0, retryAfterSeconds: 0 };
+        }
+        throw error;
+      }
+    } catch (error) {
+      await client.query("rollback");
+      throw error;
+    } finally { client.release(); }
+  }
+
+  async verifyPasswordResetChallenge(input: { challengeId: string; otpHash: string; resetTokenHash: string; resetTokenExpiresAt: Date; now: Date }): Promise<VerifyAuthChallengeResult> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("begin");
+      const result = await client.query("select * from auth_challenges where id=$1 and purpose='password_reset' for update", [input.challengeId]);
+      if (!result.rowCount) { await client.query("rollback"); return { status: "not_found", attemptsRemaining: 0, retryAfterSeconds: 0 }; }
+      const row = result.rows[0];
+      const check = await this.checkChallengeForVerification(client, row, input.now);
+      if (check) { await client.query(check.commit ? "commit" : "rollback"); return check.result; }
+      if (!otpMatches(row.otp_hash, input.otpHash) || !row.admin_id) {
+        const failure = await this.recordChallengeFailure(client, row, input.now);
+        await client.query("commit");
+        return failure;
+      }
+      const admin = await client.query("select email from admin_users where id=$1 and role='tenant'", [row.admin_id]);
+      if (!admin.rowCount) {
+        const failure = await this.recordChallengeFailure(client, row, input.now);
+        await client.query("commit");
+        return failure;
+      }
+      await client.query(
+        `update auth_challenges set consumed_at=$2,reset_token_hash=$3,reset_token_expires_at=$4,reset_consumed_at=null
+         where id=$1`,
+        [row.id, input.now, input.resetTokenHash, input.resetTokenExpiresAt]
+      );
+      await client.query("commit");
+      return { status: "ok", attemptsRemaining: 0, retryAfterSeconds: 0, email: admin.rows[0].email, adminId: row.admin_id };
+    } catch (error) {
+      await client.query("rollback");
+      throw error;
+    } finally { client.release(); }
+  }
+
+  private async checkChallengeForVerification(client: pg.PoolClient, row: pg.QueryResultRow, now: Date): Promise<{ commit: boolean; result: VerifyAuthChallengeResult } | null> {
+    if (row.consumed_at) return { commit: false, result: { status: "invalid", attemptsRemaining: 0, retryAfterSeconds: 0 } };
+    if (row.locked_until && new Date(row.locked_until) > now) {
+      return { commit: false, result: { status: "locked", attemptsRemaining: 0, retryAfterSeconds: Math.max(1, Math.ceil((new Date(row.locked_until).getTime() - now.getTime()) / 1000)) } };
+    }
+    if (new Date(row.expires_at) <= now) return { commit: false, result: { status: "expired", attemptsRemaining: 0, retryAfterSeconds: 0 } };
+    if (Number(row.attempts) >= Number(row.max_attempts)) {
+      const lockedUntil = new Date(now.getTime() + 15 * 60 * 1000);
+      await client.query("update auth_challenges set locked_until=$2 where id=$1", [row.id, lockedUntil]);
+      return { commit: true, result: { status: "locked", attemptsRemaining: 0, retryAfterSeconds: 900 } };
+    }
+    return null;
+  }
+
+  private async recordChallengeFailure(client: pg.PoolClient, row: pg.QueryResultRow, now: Date): Promise<VerifyAuthChallengeResult> {
+    const attempts = Number(row.attempts) + 1;
+    const remaining = Math.max(0, Number(row.max_attempts) - attempts);
+    if (remaining === 0) {
+      const lockedUntil = new Date(now.getTime() + 15 * 60 * 1000);
+      await client.query("update auth_challenges set attempts=$2,locked_until=$3 where id=$1", [row.id, attempts, lockedUntil]);
+      return { status: "locked", attemptsRemaining: 0, retryAfterSeconds: 900 };
+    }
+    await client.query("update auth_challenges set attempts=$2 where id=$1", [row.id, attempts]);
+    return { status: "invalid", attemptsRemaining: remaining, retryAfterSeconds: 0 };
+  }
+
+  async resetPasswordWithToken(input: { tokenHash: string; passwordHash: string; now: Date }) {
+    const client = await this.pool.connect();
+    try {
+      await client.query("begin");
+      const result = await client.query(
+        `select c.id, c.admin_id, u.email from auth_challenges c
+         join admin_users u on u.id=c.admin_id
+         where c.purpose='password_reset' and c.reset_token_hash=$1
+           and c.reset_token_expires_at > $2 and c.reset_consumed_at is null and c.consumed_at is not null
+         for update of c`,
+        [input.tokenHash, input.now]
+      );
+      if (!result.rowCount) { await client.query("rollback"); return null; }
+      const row = result.rows[0];
+      await client.query("update admin_users set password_hash=$2 where id=$1", [row.admin_id, input.passwordHash]);
+      await client.query("delete from admin_sessions where admin_id=$1", [row.admin_id]);
+      await client.query("update auth_challenges set reset_token_hash=null,reset_consumed_at=$2 where id=$1", [row.id, input.now]);
+      await client.query("commit");
+      return { email: row.email as string, adminId: row.admin_id as string };
+    } catch (error) {
+      await client.query("rollback");
+      throw error;
+    } finally { client.release(); }
+  }
+
+  async deleteExpiredAuthData(now: Date): Promise<number> {
+    const result = await this.pool.query(
+      `with deleted_challenges as (
+         delete from auth_challenges
+         where expires_at < $1 - interval '1 day' or (consumed_at is not null and consumed_at < $1 - interval '1 day')
+         returning 1
+       ), deleted_signups as (
+         delete from pending_signups where expires_at < $1 returning 1
+       ), deleted_limits as (
+         delete from auth_rate_limits where expires_at < $1 returning 1
+       )
+       select (select count(*) from deleted_challenges) + (select count(*) from deleted_signups) + (select count(*) from deleted_limits) as total`,
+      [now]
+    );
+    return Number(result.rows[0].total);
+  }
+
 
   async createForm(input: CreateFormInput, publicKey: string): Promise<FormRecord> {
     const name = formSlug(input.name);
