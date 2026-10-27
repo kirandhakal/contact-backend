@@ -437,12 +437,12 @@ export class PostgresStore implements Store {
     const result = await this.pool.query(
       `with deleted_challenges as (
          delete from auth_challenges
-         where expires_at < $1 - interval '1 day' or (consumed_at is not null and consumed_at < $1 - interval '1 day')
+         where expires_at < $1::timestamptz - interval '1 day' or (consumed_at is not null and consumed_at < $1::timestamptz - interval '1 day')
          returning 1
        ), deleted_signups as (
-         delete from pending_signups where expires_at < $1 returning 1
+         delete from pending_signups where expires_at < $1::timestamptz returning 1
        ), deleted_limits as (
-         delete from auth_rate_limits where expires_at < $1 returning 1
+         delete from auth_rate_limits where expires_at < $1::timestamptz returning 1
        )
        select (select count(*) from deleted_challenges) + (select count(*) from deleted_signups) + (select count(*) from deleted_limits) as total`,
       [now]

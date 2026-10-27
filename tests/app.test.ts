@@ -1057,6 +1057,29 @@ describe("contact form API", () => {
 
 
 describe("email-verified auth", () => {
+  it("rejects empty and invalid signup payloads without persisting records", async () => {
+    const store = new MemoryStore(); const app = makeApp(store);
+    try {
+      const headers = { origin: config.PUBLIC_BASE_URL };
+      for (const payload of [
+        {},
+        { workspaceName: "Studio", email: "not-an-email", password: "a-secure-password" },
+        { workspaceName: "!!!", email: "workspace@studio.test", password: "a-secure-password" },
+        { workspaceName: "Studio", email: "password@studio.test", password: "short" }
+      ]) {
+        const response = await app.inject({ method: "POST", url: "/v1/auth/signup", headers, payload });
+        expect(response.statusCode).toBe(422);
+        expect(response.json()).toMatchObject({ title: "Invalid request", status: 422 });
+      }
+      expect(store.pendingSignups.size).toBe(0);
+      expect(store.authChallenges.size).toBe(0);
+      expect(store.authRateLimits.size).toBe(0);
+      expect(store.admins.size).toBe(0);
+      expect(store.tenants.size).toBe(0);
+      expect(store.authEmails).toEqual([]);
+    } finally { await app.close(); }
+  });
+
   it("keeps signup pending until the correct code is verified", async () => {
     const store = new MemoryStore(); const app = makeApp(store);
     const payload = { workspaceName: "Secure Studio", email: "secure@studio.test", password: "a-secure-password" };
@@ -1274,6 +1297,14 @@ describe("website contact inbox", () => {
       const headers = { authorization: `Bearer ${config.ADMIN_API_KEY}`, origin: config.PUBLIC_BASE_URL };
       expect((await app.inject({ method: "DELETE", url: `/v1/admin/site-contact/${id}`, headers })).statusCode).toBe(200);
       expect(store.siteContacts.size).toBe(0);
+    } finally { await app.close(); }
+  });
+  it("requires Turnstile verification when configured", async () => {
+    const app = makeApp(new MemoryStore(), { ...config, TURNSTILE_SECRET_KEY: "test-secret" });
+    try {
+      const request = { method: "POST" as const, url: "/v1/site-contact", headers: { origin: config.PUBLIC_BASE_URL, "idempotency-key": randomUUID() }, payload: { name: "Alex", email: "alex@example.com", message: "Please help me get started." } };
+      expect((await app.inject(request)).statusCode).toBe(403);
+      expect((await app.inject({ ...request, headers: { ...request.headers, "turnstile-token": "" } })).statusCode).toBe(403);
     } finally { await app.close(); }
   });
   it("rate limits website messages", async () => {

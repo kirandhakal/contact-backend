@@ -31,6 +31,22 @@ npm audit --omit=dev
 
 See [UNIVERSAL_CONTACT_FORM_BACKEND.md](./UNIVERSAL_CONTACT_FORM_BACKEND.md) for the full API contract and operational notes.
 
+### Deployment smoke test
+
+The deployment workflow runs `node scripts/smoke-signup.mjs` inside the app
+container after readiness succeeds. It posts an empty signup payload, requires a
+`422 Invalid request` response, and checks the database for newly created tenant,
+admin, pending-signup, challenge, or auth-rate-limit records. Run it manually with:
+
+```sh
+docker compose --env-file .env.docker exec -T app node scripts/smoke-signup.mjs
+```
+
+The daily worker cleanup deletes expired pending signups and auth rate limits
+immediately. Authentication challenges are retained for one day after expiry or
+consumption so recently issued reset tokens remain valid; older challenges and
+their expired tokens are removed.
+
 ### Seed an admin on the deployed server
 
 Set `SEED_ADMIN_EMAIL` and `SEED_ADMIN_PASSWORD` (8–256 characters) in
@@ -144,3 +160,6 @@ applied on backend startup. Deploy this backend together with the frontend.
 accounts are denied. The frontend exposes this inbox as **Form submissions**.
 Messages remain until deleted by a service administrator. No public form key,
 email provider, worker, or tenant destination is needed to receive these messages.
+When `TURNSTILE_SECRET_KEY` is configured, submissions must also include a valid
+`Turnstile-Token` header; the public site key is configured in the frontend as
+`NEXT_PUBLIC_TURNSTILE_SITE_KEY`.

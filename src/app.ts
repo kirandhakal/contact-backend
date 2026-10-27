@@ -269,6 +269,10 @@ export function buildApp(config: AppConfig, store: Store, dependencies: AppDepen
       message: z.string().trim().min(10).max(5000), _website: z.string().max(500).optional()
     }).strict().safeParse(request.body);
     if (!parsed.success) return problem(reply, 422, "Invalid message", "Check your name, email, and message.");
+    const turnstileToken = firstHeader(request.headers["turnstile-token"]);
+    if (!(await verifyTurnstile(config.TURNSTILE_SECRET_KEY, turnstileToken, request.ip))) {
+      return problem(reply, 403, "Forbidden", "Complete the verification and try again.");
+    }
     const key = firstHeader(request.headers["idempotency-key"]);
     if (!key || !isValidIdempotencyKey(key)) return problem(reply, 422, "Invalid request", "A valid idempotency key is required.");
     if (!parsed.data._website) await store.saveSiteContact(parsed.data, key);
