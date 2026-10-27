@@ -1276,6 +1276,14 @@ describe("website contact inbox", () => {
       expect(store.siteContacts.size).toBe(0);
     } finally { await app.close(); }
   });
+  it("requires Turnstile verification when configured", async () => {
+    const app = makeApp(new MemoryStore(), { ...config, TURNSTILE_SECRET_KEY: "test-secret" });
+    try {
+      const request = { method: "POST" as const, url: "/v1/site-contact", headers: { origin: config.PUBLIC_BASE_URL, "idempotency-key": randomUUID() }, payload: { name: "Alex", email: "alex@example.com", message: "Please help me get started." } };
+      expect((await app.inject(request)).statusCode).toBe(403);
+      expect((await app.inject({ ...request, headers: { ...request.headers, "turnstile-token": "" } })).statusCode).toBe(403);
+    } finally { await app.close(); }
+  });
   it("rate limits website messages", async () => {
     const app = makeApp(new MemoryStore(), { ...config, RATE_LIMIT_MAX: 1 });
     try {

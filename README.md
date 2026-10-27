@@ -144,3 +144,6 @@ applied on backend startup. Deploy this backend together with the frontend.
 accounts are denied. The frontend exposes this inbox as **Form submissions**.
 Messages remain until deleted by a service administrator. No public form key,
 email provider, worker, or tenant destination is needed to receive these messages.
+When `TURNSTILE_SECRET_KEY` is configured, submissions must also include a valid
+`Turnstile-Token` header; the public site key is configured in the frontend as
+`NEXT_PUBLIC_TURNSTILE_SITE_KEY`.
