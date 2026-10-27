@@ -199,9 +199,10 @@ export function buildApp(config: AppConfig, store: Store, dependencies: AppDepen
   async function sendChallengeEmail(message: AuthEmailMessage) {
     try {
       await authMailer(message);
-    } catch {
-      // Never include codes or provider responses in logs.
-      app.log.warn({ event: "authentication_email_failed" }, "Authentication email delivery failed");
+    } catch (error) {
+      // Log only a safe failure reason — never OTP codes or provider response bodies.
+      const reason = error instanceof Error ? error.message : "unknown";
+      app.log.warn({ event: "authentication_email_failed", reason }, "Authentication email delivery failed");
     }
   }
 

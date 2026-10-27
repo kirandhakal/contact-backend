@@ -88,8 +88,8 @@ async function deliverEmail(job: OutboxJob, config: AppConfig): Promise<void> {
     if (config.SMTP_URL) {
       transport = nodemailer.createTransport({ url: config.SMTP_URL, ...timeouts });
     } else if ((config as any).MAIL_HOST) {
-      const mailUser = (config as any).MAIL_USERNAME || (config as any).MAIL_USER || "";
-      const mailPass = (config as any).MAIL_PASSWORD || (config as any).MAIL_PASS || "";
+      const mailUser = String((config as any).MAIL_USERNAME || (config as any).MAIL_USER || "").trim();
+      const mailPass = String((config as any).MAIL_PASSWORD || (config as any).MAIL_PASS || "").trim().replace(/^["']|["']$/g, "").replace(/\s+/g, "");
       const mailPort = Number((config as any).MAIL_PORT) || 587;
       const secure = typeof (config as any).MAIL_SECURE === "boolean" ? (config as any).MAIL_SECURE : mailPort === 465;
       transport = nodemailer.createTransport({
