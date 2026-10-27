@@ -690,7 +690,7 @@ export class PostgresStore implements Store {
       for (const row of destinations.rows) {
         const destination = mapDestination(row, this.encryptionKey);
         const eligibleIds = submissions.rows.filter(row => {
-          if (!["email", "sms"].includes(destination.kind)) return true;
+          if (!["email", "sms", "whatsapp"].includes(destination.kind)) return true;
           const recipient = destination.config.recipientField ? row.payload[String(destination.config.recipientField)] : destination.config.to;
           return (destination.kind === "email" ? z.string().email() : z.string().regex(/^\+[1-9]\d{7,14}$/)).safeParse(recipient).success;
         }).map(row => row.id);

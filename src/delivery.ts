@@ -13,6 +13,7 @@ import type { OutboxJob } from "./types.js";
 export async function deliverJob(job: OutboxJob, config: AppConfig): Promise<void> {
   if (job.destination.kind === "email") return deliverEmail(job, config);
   if (job.destination.kind === "sms") return deliverSms(job, config);
+  if (job.destination.kind === "whatsapp") return deliverWhatsapp(job, config);
   if (job.destination.kind === "discord") {
     const url = job.destination.secret;
     if (!url || !isDiscordWebhook(url)) throw new Error("Invalid Discord webhook configuration");
@@ -94,6 +95,18 @@ async function deliverSms(job: OutboxJob, config: AppConfig): Promise<void> {
   if (typeof settings.accountSid !== "string" || !/^AC[a-fA-F0-9]{32}$/.test(settings.accountSid) || !job.destination.secret) throw new Error("Invalid Twilio credentials");
   await postPublic(`https://api.twilio.com/2010-04-01/Accounts/${settings.accountSid}/Messages.json`,
     new URLSearchParams({ To: recipient(job), From: String(settings.from), Body: message(job).slice(0, 1600) }).toString(),
+    { "Content-Type": "application/x-www-form-urlencoded", Authorization: `Basic ${Buffer.from(`${settings.accountSid}:${job.destination.secret}`).toString("base64")}` }, config.WEBHOOK_TIMEOUT_MS);
+}
+
+async function deliverWhatsapp(job: OutboxJob, config: AppConfig): Promise<void> {
+  const settings = job.destination.config;
+  if (typeof settings.accountSid !== "string" || !/^AC[a-fA-F0-9]{32}$/.test(settings.accountSid) || !job.destination.secret) throw new Error("Invalid Twilio credentials");
+  const to = recipient(job);
+  const from = String(settings.from);
+  const toWhatsapp = to.startsWith("whatsapp:") ? to : `whatsapp:${to}`;
+  const fromWhatsapp = from.startsWith("whatsapp:") ? from : `whatsapp:${from}`;
+  await postPublic(`https://api.twilio.com/2010-04-01/Accounts/${settings.accountSid}/Messages.json`,
+    new URLSearchParams({ To: toWhatsapp, From: fromWhatsapp, Body: message(job).slice(0, 1600) }).toString(),
     { "Content-Type": "application/x-www-form-urlencoded", Authorization: `Basic ${Buffer.from(`${settings.accountSid}:${job.destination.secret}`).toString("base64")}` }, config.WEBHOOK_TIMEOUT_MS);
 }
 

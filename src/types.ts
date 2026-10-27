@@ -1,7 +1,7 @@
 import type { JSONSchemaType } from "ajv";
 
 export type JsonObject = Record<string, unknown>;
-export type DestinationKind = "email" | "webhook" | "sms" | "discord";
+export type DestinationKind = "email" | "webhook" | "sms" | "discord" | "whatsapp";
 export type SubmissionStatus = "accepted" | "spam" | "deleted";
 export type AdminRole = "sudo" | "super" | "tenant";
 

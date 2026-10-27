@@ -121,7 +121,7 @@ const validateCreateForm = createFormAjv.compile({
         additionalProperties: false,
         required: ["kind", "config"],
         properties: {
-          kind: { enum: ["email", "webhook", "sms", "discord"] },
+          kind: { enum: ["email", "webhook", "sms", "discord", "whatsapp"] },
           config: { type: "object" },
           secret: { type: "string", maxLength: 4096 }
         }
