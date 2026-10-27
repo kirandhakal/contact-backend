@@ -32,8 +32,22 @@ const config = {
   EMAIL_FROM: "forms@example.com",
   WEBHOOK_TIMEOUT_MS: 5000,
   SMTP_TIMEOUT_MS: 30000,
-  TURNSTILE_SECRET_KEY: ""
-};
+  TURNSTILE_SECRET_KEY: "",
+  MAIL_HOST: "",
+  MAIL_PORT: 587,
+  MAIL_AUTH: true,
+  MAIL_USERNAME: "",
+  MAIL_USER: "",
+  MAIL_PASSWORD: "",
+  MAIL_PASS: "",
+  MAIL_FROM: "",
+  ENABLE_EMAIL: true,
+  ENABLE_SMS: true,
+  ENABLE_WHATSAPP: true,
+  ENABLE_DISCORD: true,
+  ENABLE_WEBHOOK: true,
+  ENABLE_MAIL: true
+} as any;
 
 class MemoryStore implements Store {
   siteContacts = new Map<string, import("../src/types.js").SiteContactMessage>();

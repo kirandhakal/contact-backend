@@ -1,6 +1,14 @@
 import "dotenv/config";
 import { z } from "zod";
 
+const boolFromEnv = (v: unknown) => {
+  if (typeof v !== "string") return undefined;
+  const s = v.trim().toLowerCase();
+  if (s === "true" || s === "1" || s === "yes" || s === "on") return true;
+  if (s === "false" || s === "0" || s === "no" || s === "off") return false;
+  return undefined;
+};
+
 const EnvSchema = z.object({
   NODE_ENV: z.string().default("development"),
   HOST: z.string().default("0.0.0.0"),
@@ -15,10 +23,27 @@ const EnvSchema = z.object({
   RETENTION_DAYS: z.coerce.number().int().positive().default(90),
   WORKER_POLL_MS: z.coerce.number().int().positive().default(1000),
   SMTP_URL: z.string().default(""),
-  EMAIL_FROM: z.string().default("forms@example.com"),
+  EMAIL_FROM: z.string().default("kirandhakal715@gmail.com"),
   SMTP_TIMEOUT_MS: z.coerce.number().int().positive().default(30000),
   WEBHOOK_TIMEOUT_MS: z.coerce.number().int().positive().default(5000),
-  TURNSTILE_SECRET_KEY: z.string().default("")
+  TURNSTILE_SECRET_KEY: z.string().default(""),
+
+  MAIL_HOST: z.string().default(""),
+  MAIL_PORT: z.coerce.number().int().positive().default(587),
+  MAIL_AUTH: z.preprocess(boolFromEnv, z.boolean().default(true)),
+  MAIL_USERNAME: z.string().default(""),
+  MAIL_USER: z.string().default(""),
+  MAIL_PASSWORD: z.string().default(""),
+  MAIL_PASS: z.string().default(""),
+  MAIL_FROM: z.string().default("kirandhakal715@gmail.com"),
+  MAIL_SECURE: z.preprocess(boolFromEnv, z.boolean().optional()),
+
+  ENABLE_EMAIL: z.preprocess(boolFromEnv, z.boolean().default(true)),
+  ENABLE_SMS: z.preprocess(boolFromEnv, z.boolean().default(true)),
+  ENABLE_WHATSAPP: z.preprocess(boolFromEnv, z.boolean().default(true)),
+  ENABLE_DISCORD: z.preprocess(boolFromEnv, z.boolean().default(true)),
+  ENABLE_WEBHOOK: z.preprocess(boolFromEnv, z.boolean().default(true)),
+  ENABLE_MAIL: z.preprocess(boolFromEnv, z.boolean().default(true)),
 });
 
 export type AppConfig = z.infer<typeof EnvSchema>;

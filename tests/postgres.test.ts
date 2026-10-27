@@ -138,7 +138,7 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)("PostgreSQL management integrati
   it("tests selected manual integrations and replies to filtered submissions across pages while skipping invalid recipients", async () => {
     const tenant = await store.createTenant("Filtered replies");
     const publicKey = `frm_${randomUUID()}`;
-    const config = getConfig({ NODE_ENV: "test", DATABASE_URL: pool.options.connectionString!, ADMIN_API_KEY: "test-admin-key-at-least-24-characters", DATA_ENCRYPTION_KEY: "b".repeat(64), PUBLIC_BASE_URL: "http://localhost:3100" });
+    const config = getConfig({ NODE_ENV: "test", DATABASE_URL: pool.options.connectionString!, ADMIN_API_KEY: "test-admin-key-at-least-24-characters", DATA_ENCRYPTION_KEY: "b".repeat(64), PUBLIC_BASE_URL: "http://localhost:3100", MAIL_HOST:"", MAIL_PORT:587 as any, MAIL_AUTH:true as any, MAIL_USERNAME:"", MAIL_USER:"", MAIL_PASSWORD:"", MAIL_PASS:"", MAIL_FROM:"", ENABLE_EMAIL:true as any, ENABLE_SMS:true as any, ENABLE_WHATSAPP:true as any, ENABLE_DISCORD:true as any, ENABLE_WEBHOOK:true as any, ENABLE_MAIL:true as any });
     const app = buildApp(config, store);
     const headers = { authorization: `Bearer ${config.ADMIN_API_KEY}` };
     try {

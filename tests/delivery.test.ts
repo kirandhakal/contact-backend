@@ -7,7 +7,7 @@ vi.mock("nodemailer", () => ({ default: { createTransport: mocks.transport } }))
 import { deliverJob } from "../src/delivery.js";
 import { getConfig } from "../src/config.js";
 import type { OutboxJob } from "../src/types.js";
-const config = getConfig({ ADMIN_API_KEY: "a".repeat(24), DATA_ENCRYPTION_KEY: "b".repeat(64), SMTP_URL: "smtp://service.example.com", EMAIL_FROM: "service@example.com" });
+const config = getConfig({ ADMIN_API_KEY: "a".repeat(24), DATA_ENCRYPTION_KEY: "b".repeat(64), SMTP_URL: "smtp://service.example.com", EMAIL_FROM: "service@example.com", MAIL_HOST:"", MAIL_PORT:"587", MAIL_AUTH:"true", MAIL_USERNAME:"", MAIL_USER:"", MAIL_PASSWORD:"", MAIL_PASS:"", MAIL_FROM:"", ENABLE_EMAIL:"true", ENABLE_SMS:"true", ENABLE_WHATSAPP:"true", ENABLE_DISCORD:"true", ENABLE_WEBHOOK:"true", ENABLE_MAIL:"true" } as any);
 function job(kind: OutboxJob["destination"]["kind"], settings: Record<string, unknown>, secret?: string): OutboxJob {
   return { id: "job", attempts: 0, destination: { id: "dest", formId: "form", active: true, kind, config: settings, secret }, form: { id: "form", name: "Contact" },
     submission: { id: "sub", tenantId: "tenant", formId: "form", formVersion: 1, payload: { name: "Alex", email: "alex@example.com", phone: "+14155550123", message: "@everyone" }, status: "accepted", sourceIpHash: "test", createdAt: "2026-09-30", expiresAt: "2027-09-30" } };

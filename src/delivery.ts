@@ -11,6 +11,16 @@ import { isDiscordWebhook, renderTemplate } from "./integrations.js";
 import type { OutboxJob } from "./types.js";
 
 export async function deliverJob(job: OutboxJob, config: AppConfig): Promise<void> {
+  const c = config as any;
+  const enabled = (kind: string) => {
+    if (kind === "email" || kind === "mail") return c.ENABLE_EMAIL !== false && c.ENABLE_MAIL !== false;
+    if (kind === "sms") return c.ENABLE_SMS !== false;
+    if (kind === "whatsapp") return c.ENABLE_WHATSAPP !== false;
+    if (kind === "discord") return c.ENABLE_DISCORD !== false;
+    if (kind === "webhook") return c.ENABLE_WEBHOOK !== false;
+    return true;
+  };
+  if (!enabled(job.destination.kind)) throw new Error("This channel is disabled by server configuration");
   if (job.destination.kind === "email") return deliverEmail(job, config);
   if (job.destination.kind === "sms") return deliverSms(job, config);
   if (job.destination.kind === "whatsapp") return deliverWhatsapp(job, config);
@@ -75,11 +85,28 @@ async function deliverEmail(job: OutboxJob, config: AppConfig): Promise<void> {
       auth: { user: String(settings.smtpUser), pass: job.destination.secret ?? "" },
       ...timeouts });
   } else {
-    if (!config.SMTP_URL) throw new Error("Service SMTP is not configured; choose a custom SMTP server");
-    transport = nodemailer.createTransport({ url: config.SMTP_URL, ...timeouts });
+    if (config.SMTP_URL) {
+      transport = nodemailer.createTransport({ url: config.SMTP_URL, ...timeouts });
+    } else if ((config as any).MAIL_HOST) {
+      const mailUser = (config as any).MAIL_USERNAME || (config as any).MAIL_USER || "";
+      const mailPass = (config as any).MAIL_PASSWORD || (config as any).MAIL_PASS || "";
+      const mailPort = Number((config as any).MAIL_PORT) || 587;
+      const secure = typeof (config as any).MAIL_SECURE === "boolean" ? (config as any).MAIL_SECURE : mailPort === 465;
+      transport = nodemailer.createTransport({
+        host: (config as any).MAIL_HOST,
+        port: mailPort,
+        secure,
+        requireTLS: mailPort === 587 || !secure,
+        auth: ((config as any).MAIL_AUTH !== false && (mailUser || mailPass)) ? { user: mailUser, pass: mailPass } : undefined,
+        ...timeouts
+      });
+    } else {
+      throw new Error("Service SMTP is not configured; choose a custom SMTP server");
+    }
   }
   try {
-    await transport.sendMail({ from: typeof settings.from === "string" ? settings.from : config.EMAIL_FROM,
+    const from = typeof settings.from === "string" ? settings.from : ((config as any).MAIL_FROM || config.EMAIL_FROM);
+    await transport.sendMail({ from,
       to, subject: cleanEmailSubject(typeof settings.subject === "string" ? renderTemplate(settings.subject, job) : undefined),
       text: message(job), disableFileAccess: true, disableUrlAccess: true });
   } catch (error) {

@@ -8,12 +8,13 @@ const field = text.max(80).regex(/^[a-zA-Z][a-zA-Z0-9_]*$/);
 const phone = z.string().regex(/^\+[1-9]\d{7,14}$/);
 const template = z.string().min(1).max(8000);
 const recipient = { to: text.optional(), recipientField: field.optional() };
-const emailConfig = z.object({ ...recipient, subject: z.string().min(1).max(200).optional(), template: template.optional(),
+const emailConfig = z.object({ name: z.string().trim().min(1).max(100).optional(), ...recipient, subject: z.string().min(1).max(200).optional(), template: template.optional(),
   from: z.string().email().optional(), smtpHost: text.max(253).regex(/^[a-zA-Z0-9.-]+$/).optional(),
   smtpPort: z.union([z.literal(465), z.literal(587)]).optional(), smtpUser: text.max(254).optional() }).strict();
-const smsConfig = z.object({ ...recipient, accountSid: z.string().regex(/^AC[a-fA-F0-9]{32}$/), from: phone, template: template.max(1600) }).strict();
-const whatsappConfig = z.object({ ...recipient, accountSid: z.string().regex(/^AC[a-fA-F0-9]{32}$/), from: phone, template: template.max(1600) }).strict();
-const webhookConfig = z.object({ url: z.string().max(2048).refine(isSafeWebhookUrl), template: template.optional() }).strict();
+const smsConfig = z.object({ name: z.string().trim().min(1).max(100).optional(), ...recipient, accountSid: z.string().regex(/^AC[a-fA-F0-9]{32}$/), from: phone, template: template.max(1600) }).strict();
+const whatsappConfig = z.object({ name: z.string().trim().min(1).max(100).optional(), ...recipient, accountSid: z.string().regex(/^AC[a-fA-F0-9]{32}$/), from: phone, template: template.max(1600) }).strict();
+const webhookConfig = z.object({ name: z.string().trim().min(1).max(100).optional(), url: z.string().max(2048).refine(isSafeWebhookUrl), template: template.optional() }).strict();
+const discordConfig = z.object({ name: z.string().trim().min(1).max(100).optional(), template: template.max(2000) }).strict();
 export const destinationSchema = z.object({
   id: z.string().uuid().optional(), kind: z.enum(["email", "sms", "discord", "webhook", "whatsapp"]),
   config: z.record(z.unknown()), secret: z.string().max(4096).optional()
@@ -54,7 +55,7 @@ export function validateDestinations(value: unknown, schema: JsonObject, existin
       if (item.kind === "email" && !config.smtpHost && (config.smtpPort || config.smtpUser || config.from || secret)) throw new Error("Select custom SMTP to supply mail server credentials.");
       if ((item.kind === "sms" || item.kind === "whatsapp") && !secret) throw new Error("Twilio requires an Auth Token.");
     } else if (item.kind === "discord") {
-      config = z.object({ template: template.max(2000) }).strict().parse(item.config);
+      config = discordConfig.parse(item.config);
       if (!secret || !isDiscordWebhook(secret)) throw new Error("Enter a Discord channel webhook URL from discord.com.");
     } else {
       config = webhookConfig.parse(item.config);
