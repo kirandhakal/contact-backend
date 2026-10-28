@@ -1,5 +1,7 @@
 import { validateDestinations } from "./integrations.js";
 import { randomUUID } from "node:crypto";
+import multipart from "@fastify/multipart";
+import { uploadFile } from "./storage.js";
 import { generateOtp, hashOtp, hashResetToken, isSixDigitCode, newResetToken, normalizeEmail } from "./auth-otp.js";
 import { sendAuthEmail, type AuthEmailMessage } from "./auth-email.js";
 import { formSlug, tenantSlug } from "./tenant-name.js";
@@ -230,6 +232,12 @@ export function buildApp(config: AppConfig, store: Store, dependencies: AppDepen
   app.addHook("onSend", async (request, reply) => {
     applySecurityHeaders(reply);
     if (request.url.startsWith("/v1/admin") || request.url.startsWith("/v1/auth")) reply.header("Cache-Control", "no-store");
+  });
+
+  app.register(multipart, {
+    limits: {
+      fileSize: 50 * 1024 * 1024, // 50MB default
+    }
   });
 
   app.setErrorHandler((error: FastifyError, _request, reply) => {
@@ -1060,6 +1068,27 @@ export function buildApp(config: AppConfig, store: Store, dependencies: AppDepen
     };
     return reply.code(result.duplicate ? 200 : 202).send(response);
   });
+
+  // File upload endpoint for forms
+  app.post<{ Params: { publicKey: string } }>("/v1/forms/:publicKey/upload", async (request, reply) => {
+    const form = await store.getActiveForm(request.params.publicKey);
+    if (!form) return problem(reply, 404, "Not found", "Form not found or disabled.");
+    if (!isAllowedOrigin(request.headers.origin, form.allowedOrigins)) {
+      return problem(reply, 403, "Forbidden", "Origin is not allowed for this form.");
+    }
+    applyCors(reply, request.headers.origin);
+
+    try {
+      const data = await request.file();
+      if (!data) return problem(reply, 400, "Bad request", "No file uploaded.");
+      const buffer = await data.toBuffer();
+      const url = await uploadFile(buffer, data.filename, data.mimetype);
+      return { url, filename: data.filename, mimetype: data.mimetype, size: buffer.length };
+    } catch (error: any) {
+      return problem(reply, 500, "Upload failed", error.message || "Failed to upload file.");
+    }
+  });
+
 
   app.get<{ Params: { submissionId: string } }>("/v1/submissions/:submissionId", async (request, reply) => {
     const authorization = request.headers.authorization;
