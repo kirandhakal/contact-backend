@@ -950,6 +950,23 @@ export function buildApp(config: AppConfig, store: Store, dependencies: AppDepen
     return reply.code(202).send({ message: ids ? `Test submission saved with the same field data. ${queued} selected integration messages queued.` : "Test submission saved. Automatic messages are queued; check delivery status below.", submissionId: result.submission.id });
   });
 
+  app.post<{ Params: { publicKey: string } }>("/v1/admin/forms/:publicKey/upload", async (request, reply) => {
+    const actor = await adminFor(request);
+    if (!actor) return problem(reply, 401, "Unauthorized", "Sign in required.");
+    if (!sameOrigin(request) && actor.id !== "service-key") return problem(reply, 403, "Forbidden", "Invalid origin.");
+    const form = await store.getForm(request.params.publicKey);
+    if (!form || (actor.role === "tenant" && actor.tenantId !== form.tenantId)) return problem(reply, 404, "Not found", "Form not found.");
+    try {
+      const data = await request.file();
+      if (!data) return problem(reply, 400, "Bad request", "No file uploaded.");
+      const buffer = await data.toBuffer();
+      const url = await uploadFile(buffer, data.filename, data.mimetype);
+      return { url, filename: data.filename, mimetype: data.mimetype, size: buffer.length };
+    } catch (error: any) {
+      return problem(reply, 500, "Upload failed", error.message || "Failed to upload file.");
+    }
+  });
+
   app.get<{ Params: { publicKey: string; submissionId: string } }>("/v1/admin/forms/:publicKey/delivery/:submissionId", async (request, reply) => {
     const actor = await adminFor(request);
     if (!actor) return problem(reply, 401, "Unauthorized", "Sign in required.");
