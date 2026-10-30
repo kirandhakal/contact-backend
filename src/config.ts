@@ -57,6 +57,15 @@ const EnvSchema = z.object({
   ENABLE_DISCORD: z.preprocess(boolFromEnv, z.boolean().default(true)),
   ENABLE_WEBHOOK: z.preprocess(boolFromEnv, z.boolean().default(true)),
   ENABLE_MAIL: z.preprocess(boolFromEnv, z.boolean().default(true)),
+  // OCI Configuration
+  OCI_ACCESS_KEY: z.string().optional(),
+  OCI_SECRET_KEY: z.string().optional(),
+  OCI_NAMESPACE: z.string().optional(),
+  OCI_REGION: z.string().optional(),
+  OCI_BUCKET: z.string().optional(),
+  OCI_TENANCY_OCID: z.string().optional(),
+  OCI_USER_OCID: z.string().optional(),
+  OCI_FINGERPRINT: z.string().optional(),
 });
 
 export type AppConfig = z.infer<typeof EnvSchema>;
@@ -68,3 +77,4 @@ export function getConfig(env = process.env): AppConfig {
   }
   return config;
 }
+

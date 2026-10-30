@@ -21,8 +21,12 @@ async function start() {
   await app.listen({ host: config.HOST, port: config.PORT });
 }
 
-start().catch(async (error) => {
-  app.log.error(error);
-  await store.close();
-  process.exitCode = 1;
-});
+(async () => {
+  try {
+    await start();
+  } catch (error) {
+    app.log.error(error);
+    await store.close();
+    process.exitCode = 1;
+  }
+})();
