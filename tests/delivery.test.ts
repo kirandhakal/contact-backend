@@ -7,7 +7,12 @@ vi.mock("nodemailer", () => ({ default: { createTransport: mocks.transport } }))
 import { deliverJob } from "../src/delivery.js";
 import { getConfig } from "../src/config.js";
 import type { OutboxJob } from "../src/types.js";
-const config = getConfig({ ADMIN_API_KEY: "a".repeat(24), DATA_ENCRYPTION_KEY: "b".repeat(64), SMTP_URL: "smtp://service.example.com", EMAIL_FROM: "service@example.com", MAIL_HOST:"", MAIL_PORT:"587", MAIL_AUTH:"true", MAIL_USERNAME:"", MAIL_USER:"", MAIL_PASSWORD:"", MAIL_PASS:"", MAIL_FROM:"", ENABLE_EMAIL:"true", ENABLE_SMS:"true", ENABLE_WHATSAPP:"true", ENABLE_DISCORD:"true", ENABLE_WEBHOOK:"true", ENABLE_MAIL:"true" } as any);
+const slackWebhook = process.env.TEST_SLACK_WEBHOOK_URL;
+const getSlackWebhook = () => {
+  if (!slackWebhook) throw new Error("TEST_SLACK_WEBHOOK_URL is required for Slack delivery tests");
+  return slackWebhook;
+};
+const config = getConfig({ ADMIN_API_KEY: "a".repeat(24), DATA_ENCRYPTION_KEY: "b".repeat(64), SMTP_URL: "smtp://service.example.com", EMAIL_FROM: "service@example.com", MAIL_HOST:"", MAIL_PORT:"587", MAIL_AUTH:"true", MAIL_USERNAME:"", MAIL_USER:"", MAIL_PASSWORD:"", MAIL_PASS:"", MAIL_FROM:"", ENABLE_EMAIL:"true", ENABLE_SMS:"true", ENABLE_WHATSAPP:"true", ENABLE_DISCORD:"true", ENABLE_SLACK:"true", ENABLE_WEBHOOK:"true", ENABLE_MAIL:"true" } as any);
 function job(kind: OutboxJob["destination"]["kind"], settings: Record<string, unknown>, secret?: string): OutboxJob {
   return { id: "job", attempts: 0, destination: { id: "dest", formId: "form", active: true, kind, config: settings, secret }, form: { id: "form", name: "Contact" },
     submission: { id: "sub", tenantId: "tenant", formId: "form", formVersion: 1, payload: { name: "Alex", email: "alex@example.com", phone: "+14155550123", message: "@everyone" }, status: "accepted", sourceIpHash: "test", createdAt: "2026-09-30", expiresAt: "2027-09-30" } };
@@ -55,6 +60,17 @@ describe("delivery adapters", () => {
     await deliverJob(job("discord", { template: "New {{name}}: {{message}}" }, "https://discord.com/api/webhooks/123/token"), config);
     expect(JSON.parse(mocks.body)).toEqual({ content: "New Alex: @everyone", allowed_mentions: { parse: [] } });
     expect(mocks.request.mock.calls[0][0]).toMatchObject({ hostname: "93.184.216.34", servername: "discord.com", path: "/api/webhooks/123/token?wait=true" });
+  });
+  it.skipIf(!slackWebhook)("sends Slack text with mentions and previews disabled", async () => {
+    const url = new URL(getSlackWebhook());
+    await deliverJob(job("slack", { template: "New {{name}}: {{message}}" }, getSlackWebhook()), config);
+    expect(JSON.parse(mocks.body)).toEqual({ text: "New Alex: @everyone", mrkdwn: false, unfurl_links: false, unfurl_media: false });
+    expect(mocks.request.mock.calls[0][0]).toMatchObject({ hostname: "93.184.216.34", servername: url.hostname, path: url.pathname });
+  });
+  it.skipIf(!slackWebhook)("translates a custom webhook aimed at a Slack incoming webhook", async () => {
+    await deliverJob(job("webhook", { url: getSlackWebhook(), template: "Hi {{name}}" }, "secret"), config);
+    expect(JSON.parse(mocks.body)).toEqual({ text: "Hi Alex", mrkdwn: false, unfurl_links: false, unfurl_media: false });
+    expect(mocks.request.mock.calls[0][0].headers["X-Forms-Signature"]).toMatch(/^v1=[a-f0-9]{64}$/);
   });
   it("sends Twilio form-encoded SMS to the submitted phone number", async () => {
     const sid = `AC${"a".repeat(32)}`;

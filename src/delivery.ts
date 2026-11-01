@@ -7,7 +7,7 @@ import nodemailer from "nodemailer";
 import { z } from "zod";
 import type { AppConfig } from "./config.js";
 import { cleanEmailSubject, isSafeWebhookUrl } from "./security.js";
-import { isDiscordWebhook, renderTemplate } from "./integrations.js";
+import { isDiscordWebhook, isSlackWebhook, renderTemplate } from "./integrations.js";
 import type { OutboxJob } from "./types.js";
 
 export async function deliverJob(job: OutboxJob, config: AppConfig): Promise<void> {
@@ -17,6 +17,7 @@ export async function deliverJob(job: OutboxJob, config: AppConfig): Promise<voi
     if (kind === "sms") return c.ENABLE_SMS !== false;
     if (kind === "whatsapp") return c.ENABLE_WHATSAPP !== false;
     if (kind === "discord") return c.ENABLE_DISCORD !== false;
+    if (kind === "slack") return c.ENABLE_SLACK !== false;
     if (kind === "webhook") return c.ENABLE_WEBHOOK !== false;
     return true;
   };
@@ -28,6 +29,12 @@ export async function deliverJob(job: OutboxJob, config: AppConfig): Promise<voi
     const url = job.destination.secret;
     if (!url || !isDiscordWebhook(url)) throw new Error("Invalid Discord webhook configuration");
     await postPublic(`${url}?wait=true`, JSON.stringify({ content: message(job).slice(0, 2000), allowed_mentions: { parse: [] } }), { "Content-Type": "application/json" }, config.WEBHOOK_TIMEOUT_MS);
+    return;
+  }
+  if (job.destination.kind === "slack") {
+    const url = job.destination.secret;
+    if (!url || !isSlackWebhook(url)) throw new Error("Invalid Slack webhook configuration");
+    await postPublic(url, JSON.stringify({ text: message(job).slice(0, 4000), mrkdwn: false, unfurl_links: false, unfurl_media: false }), { "Content-Type": "application/json" }, config.WEBHOOK_TIMEOUT_MS);
     return;
   }
   await deliverWebhook(job, config);
@@ -140,10 +147,24 @@ async function deliverWhatsapp(job: OutboxJob, config: AppConfig): Promise<void>
 async function deliverWebhook(job: OutboxJob, config: AppConfig): Promise<void> {
   const url = job.destination.config.url;
   if (!isSafeWebhookUrl(url) || !job.destination.secret) throw new Error("Invalid webhook configuration");
+  const timestamp = Math.floor(Date.now() / 1000).toString();
+  // Slack and Discord incoming webhooks ignore Contact's event envelope. Translate
+  // the message so a custom webhook pointed at either service still posts visibly.
+  if (isSlackWebhook(url)) {
+    const body = JSON.stringify({ text: message(job).slice(0, 4000), mrkdwn: false, unfurl_links: false, unfurl_media: false });
+    const signature = createHmac("sha256", job.destination.secret).update(`${timestamp}.${body}`).digest("hex");
+    await postPublic(url, body, { "Content-Type": "application/json", "X-Forms-Timestamp": timestamp, "X-Forms-Signature": `v1=${signature}` }, config.WEBHOOK_TIMEOUT_MS);
+    return;
+  }
+  if (isDiscordWebhook(url)) {
+    const body = JSON.stringify({ content: message(job).slice(0, 2000), allowed_mentions: { parse: [] } });
+    const signature = createHmac("sha256", job.destination.secret).update(`${timestamp}.${body}`).digest("hex");
+    await postPublic(url, body, { "Content-Type": "application/json", "X-Forms-Timestamp": timestamp, "X-Forms-Signature": `v1=${signature}` }, config.WEBHOOK_TIMEOUT_MS);
+    return;
+  }
   const body = JSON.stringify({ id: job.submission.id, deliveryId: job.id, type: job.destination.config.eventType === "form.reply.created" ? "form.reply.created" : "form.submission.created", createdAt: job.submission.createdAt,
     form: { id: job.form.id, name: job.form.name }, data: job.submission.payload,
     ...(job.destination.config.template ? { message: message(job) } : {}) });
-  const timestamp = Math.floor(Date.now() / 1000).toString();
   const signature = createHmac("sha256", job.destination.secret).update(`${timestamp}.${body}`).digest("hex");
   await postPublic(url, body, { "Content-Type": "application/json", "X-Forms-Timestamp": timestamp, "X-Forms-Signature": `v1=${signature}` }, config.WEBHOOK_TIMEOUT_MS);
 }

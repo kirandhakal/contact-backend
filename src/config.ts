@@ -55,6 +55,7 @@ const EnvSchema = z.object({
   ENABLE_SMS: z.preprocess(boolFromEnv, z.boolean().default(true)),
   ENABLE_WHATSAPP: z.preprocess(boolFromEnv, z.boolean().default(true)),
   ENABLE_DISCORD: z.preprocess(boolFromEnv, z.boolean().default(true)),
+  ENABLE_SLACK: z.preprocess(boolFromEnv, z.boolean().default(true)),
   ENABLE_WEBHOOK: z.preprocess(boolFromEnv, z.boolean().default(true)),
   ENABLE_MAIL: z.preprocess(boolFromEnv, z.boolean().default(true)),
   // OCI Configuration

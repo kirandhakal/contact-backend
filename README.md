@@ -104,23 +104,30 @@ user therefore needs the same schema permissions as the migration command.
 
 ### Delivery integrations and confirmations
 
-The form editor supports multiple email, Twilio SMS, Discord, and signed webhook
-rules, including updates to existing forms. See the web app's `/docs/integrations`
-for setup, message placeholders, examples, and signature verification.
+The form editor supports multiple email, Twilio SMS, Slack, Discord, and signed
+webhook rules, including updates to existing forms. See the web app's
+`/docs/integrations` for setup, message placeholders, examples, and signature
+verification.
 
 - `email`: `config.to` or `config.recipientField`; optional `subject` and `template`.
   Custom SMTP adds `smtpHost`, `smtpPort` (465 or 587), `smtpUser`, `from`, and
   `secret` (password). Otherwise the worker uses `SMTP_URL` and `EMAIL_FROM`.
 - `sms`: `config.accountSid`, `from`, `to` or `recipientField`, `template`, and
   `secret` (Twilio Auth Token). Numbers use E.164 international format.
+- `slack`: `config.template` and `secret` (the incoming webhook URL from
+  `hooks.slack.com`). Messages are sent as plain text with Markdown parsing and
+  link previews disabled. Set `ENABLE_SLACK=false` to disable this channel.
 - `discord`: `config.template` and `secret` (the channel webhook URL).
 - `webhook`: `config.url`, optional `template`, and a signing `secret` of at least
   24 characters. The event retains `data` and includes rendered `message` when set.
+  Slack and Discord incoming webhook URLs are translated into their native message
+  formats automatically.
 
 Templates support `{{fieldKey}}`, `{{form.name}}`, `{{submission.id}}`, and
 `{{submission.createdAt}}`. Recipient fields must exist and be required strings.
 Templates are plain text, not HTML or executable expressions. Invalid recipients
-fail delivery. SMS and Discord outputs are truncated at 1,600 and 2,000 characters.
+fail delivery. SMS, Discord, and Slack outputs are truncated at 1,600, 2,000, and
+4,000 characters.
 
 `GET /v1/admin/forms/:publicKey/destinations` returns authorized configuration with
 `hasSecret` flags, never the secret. Update destinations in the normal form PATCH

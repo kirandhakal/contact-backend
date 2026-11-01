@@ -13,10 +13,11 @@ const emailConfig = z.object({ name: z.string().trim().min(1).max(100).optional(
   smtpPort: z.union([z.literal(465), z.literal(587)]).optional(), smtpUser: text.max(254).optional() }).strict();
 const smsConfig = z.object({ name: z.string().trim().min(1).max(100).optional(), ...recipient, accountSid: z.string().regex(/^AC[a-fA-F0-9]{32}$/), from: phone, template: template.max(1600) }).strict();
 const whatsappConfig = z.object({ name: z.string().trim().min(1).max(100).optional(), ...recipient, accountSid: z.string().regex(/^AC[a-fA-F0-9]{32}$/), from: phone, template: template.max(1600) }).strict();
-const webhookConfig = z.object({ name: z.string().trim().min(1).max(100).optional(), url: z.string().max(2048).refine(isSafeWebhookUrl), template: template.optional() }).strict();
+const webhookConfig = z.object({ name: z.string().trim().min(1).max(100).optional(), url: z.string().max(2048).refine(isSafeWebhookUrl), template: template.optional(), eventType: z.enum(["form.submission.created", "form.reply.created"]).optional() }).strict();
 const discordConfig = z.object({ name: z.string().trim().min(1).max(100).optional(), template: template.max(2000) }).strict();
+const slackConfig = z.object({ name: z.string().trim().min(1).max(100).optional(), template: template.max(4000) }).strict();
 export const destinationSchema = z.object({
-  id: z.string().uuid().optional(), kind: z.enum(["email", "sms", "discord", "webhook", "whatsapp"]),
+  id: z.string().uuid().optional(), kind: z.enum(["email", "sms", "discord", "slack", "webhook", "whatsapp"]),
   config: z.record(z.unknown()), secret: z.string().max(4096).optional()
 }).strict();
 
@@ -25,6 +26,16 @@ export function isDiscordWebhook(value: string): boolean {
     const url = new URL(value);
     return url.protocol === "https:" && url.hostname === "discord.com" && !url.port && !url.username && !url.password &&
       /^\/api(?:\/v\d+)?\/webhooks\/\d+\/[A-Za-z0-9._-]+$/.test(url.pathname) && !url.search && !url.hash;
+  } catch { return false; }
+}
+
+export function isSlackWebhook(value: string): boolean {
+  try {
+    const url = new URL(value);
+    const host = url.hostname.toLowerCase();
+    return url.protocol === "https:" && (host === "hooks.slack.com" || host === "hooks.slack-gov.com") &&
+      !url.port && !url.username && !url.password &&
+      /^\/services\/[A-Za-z0-9_-]+\/[A-Za-z0-9_-]+\/[A-Za-z0-9_-]+$/.test(url.pathname) && !url.search && !url.hash;
   } catch { return false; }
 }
 
@@ -57,6 +68,9 @@ export function validateDestinations(value: unknown, schema: JsonObject, existin
     } else if (item.kind === "discord") {
       config = discordConfig.parse(item.config);
       if (!secret || !isDiscordWebhook(secret)) throw new Error("Enter a Discord channel webhook URL from discord.com.");
+    } else if (item.kind === "slack") {
+      config = slackConfig.parse(item.config);
+      if (!secret || !isSlackWebhook(secret)) throw new Error("Enter a Slack incoming webhook URL from hooks.slack.com.");
     } else {
       config = webhookConfig.parse(item.config);
       if (!secret || secret.length < 24) throw new Error("Webhooks require a signing secret of at least 24 characters.");

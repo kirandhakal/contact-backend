@@ -47,6 +47,7 @@ const config = {
   ENABLE_SMS: true,
   ENABLE_WHATSAPP: true,
   ENABLE_DISCORD: true,
+  ENABLE_SLACK: true,
   ENABLE_WEBHOOK: true,
   ENABLE_MAIL: true,
   TRUST_PROXY: false,

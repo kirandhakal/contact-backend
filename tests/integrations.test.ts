@@ -1,8 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { decryptDestination, encryptDestination, isDiscordWebhook, renderTemplate, validateDestinations } from "../src/integrations.js";
+import { decryptDestination, encryptDestination, isDiscordWebhook, isSlackWebhook, renderTemplate, validateDestinations } from "../src/integrations.js";
 import type { DestinationRecord, OutboxJob } from "../src/types.js";
 const schema = { type: "object", required: ["email", "phone"], properties: { email: { type: "string", format: "email" }, phone: { type: "string" }, name: { type: "string" } } };
 const email = { kind: "email", config: { recipientField: "email", subject: "Thanks {{name}}", template: "Hello {{name}}", smtpHost: "smtp.example.com", smtpPort: 587, smtpUser: "mailer", from: "hello@example.com" }, secret: "a-private-password" };
+const slackWebhook = process.env.TEST_SLACK_WEBHOOK_URL;
+const getSlackWebhook = () => {
+  if (!slackWebhook) throw new Error("TEST_SLACK_WEBHOOK_URL is required for Slack integration tests");
+  return slackWebhook;
+};
 
 describe("integration configuration", () => {
   it("preserves manual and automatic modes and rejects unknown triggers", () => {
@@ -36,6 +41,23 @@ describe("integration configuration", () => {
   it("only accepts Discord webhook URLs on the supported host", () => {
     expect(isDiscordWebhook("https://discord.com/api/webhooks/123/abc_def")).toBe(true);
     for (const url of ["https://discord.com.evil.test/api/webhooks/123/token", "http://discord.com/api/webhooks/123/token", "https://discord.com/api/webhooks/123/token?redirect=1"]) expect(isDiscordWebhook(url)).toBe(false);
+  });
+  it.skipIf(!slackWebhook)("only accepts Slack incoming webhook URLs on the supported hosts", () => {
+    const url = new URL(getSlackWebhook());
+    expect(isSlackWebhook(url.toString())).toBe(true);
+    expect(isSlackWebhook(new URL(`${url.pathname}`, "https://hooks.slack-gov.com").toString())).toBe(true);
+    for (const invalid of [
+      new URL(`${url.pathname}`, `${url.protocol}//${url.hostname}.evil.test`).toString(),
+      `${url.protocol === "https:" ? "http:" : "https:"}//${url.host}${url.pathname}`,
+      `${url.toString()}?redirect=1`,
+      `${url.origin}/workflows${url.pathname}`
+    ]) expect(isSlackWebhook(invalid)).toBe(false);
+  });
+  it.skipIf(!slackWebhook)("validates a Slack destination using the webhook URL as its secret", () => {
+    const url = getSlackWebhook();
+    const parsed = validateDestinations([{ kind: "slack", config: { template: "New {{name}}" }, secret: url }], schema);
+    expect(parsed[0]).toEqual({ kind: "slack", config: { template: "New {{name}}" }, secret: url });
+    expect(() => validateDestinations([{ kind: "slack", config: { template: "New {{name}}" }, secret: "https://example.com/webhook" }], schema)).toThrow(/Slack/);
   });
   it("substitutes own fields once, preserving text without evaluating expressions", () => {
     const job = { form: { name: "Contact" }, submission: { id: "id", createdAt: "date", payload: { name: "{{email}}", email: "a@example.com", choices: ["one", "two"] } } } as unknown as OutboxJob;

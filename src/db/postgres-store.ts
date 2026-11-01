@@ -1015,7 +1015,7 @@ export class PostgresStore implements Store {
           return (destination.kind === "email" ? z.string().email() : z.string().regex(/^\+[1-9]\d{7,14}$/)).safeParse(recipient).success;
         }).map(row => row.id);
         if (!eligibleIds.length) continue;
-        const max = destination.kind === "discord" ? 2000 : destination.kind === "sms" ? 1600 : 8000;
+        const max = destination.kind === "discord" ? 2000 : destination.kind === "slack" ? 4000 : destination.kind === "sms" ? 1600 : 8000;
         if (message.length > max) throw new Error(`Message exceeds the ${max} character limit for ${destination.kind}.`);
         // Snapshot the message and credentials so later edits cannot change a queued reply.
         const snapshot = await client.query("INSERT INTO destinations(form_id,kind,config,active) VALUES($1,$2,$3,false) RETURNING id", [formId, destination.kind,
