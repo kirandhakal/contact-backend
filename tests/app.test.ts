@@ -1015,7 +1015,7 @@ describe("contact form API", () => {
     );
   });
 
-  it("requires bot verification when Turnstile is configured", async () => {
+  it("does not require bot verification for form submissions when Turnstile is configured", async () => {
     const store = new MemoryStore();
     const secureConfig = { ...config, TURNSTILE_SECRET_KEY: "test-secret" };
     const app = makeApp(store, secureConfig);
@@ -1051,13 +1051,25 @@ describe("contact form API", () => {
       payload: { name: "Jane", email: "jane@example.com", topic: "support" }
     });
 
-    expect(response.statusCode).toBe(403);
-    expect(response.json().detail).toBe("Bot verification failed.");
+    expect(response.statusCode).toBe(202);
+    expect(response.json().status).toBe("accepted");
   });
 });
 
 
 describe("email-verified auth", () => {
+  it("requires bot verification for tenant signup when Turnstile is configured", async () => {
+    const store = new MemoryStore();
+    const app = makeApp(store, { ...config, TURNSTILE_SECRET_KEY: "test-secret" });
+    try {
+      const payload = { workspaceName: "Bot Studio", email: "bot@studio.test", password: "a-secure-password" };
+      const response = await app.inject({ method: "POST", url: "/v1/auth/signup", headers: { origin: config.PUBLIC_BASE_URL }, payload });
+      expect(response.statusCode).toBe(403);
+      expect(response.json().detail).toBe("Bot verification failed.");
+      expect(store.pendingSignups.size).toBe(0);
+    } finally { await app.close(); }
+  });
+
   it("rejects empty and invalid signup payloads without persisting records", async () => {
     const store = new MemoryStore(); const app = makeApp(store);
     try {

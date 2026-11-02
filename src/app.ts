@@ -373,6 +373,10 @@ export function buildApp(config: AppConfig, store: Store, dependencies: AppDepen
       return problem(reply, 422, "Invalid request", "Use a workspace name that produces a valid workspace.");
     }
     if (phone && !/^\+[1-9]\d{7,14}$/.test(phone)) return problem(reply, 422, "Invalid request", "Use an international phone number, or leave it blank.");
+    const turnstileToken = firstHeader(request.headers["turnstile-token"]);
+    if (!(await verifyTurnstile(config.TURNSTILE_SECRET_KEY, turnstileToken, request.ip))) {
+      return problem(reply, 403, "Forbidden", "Bot verification failed.");
+    }
 
     const limited = await enforceAuthRate("signup:ip", request.ip, 15 * 60, 5, reply);
     if (limited) return limited;
@@ -1024,11 +1028,6 @@ export function buildApp(config: AppConfig, store: Store, dependencies: AppDepen
       return problem(reply, 429, "Submission limit reached", "This workspace has reached its submission allowance.");
     }
     applyCors(reply, request.headers.origin);
-
-    const turnstileToken = firstHeader(request.headers["turnstile-token"]);
-    if (!(await verifyTurnstile(config.TURNSTILE_SECRET_KEY, turnstileToken, request.ip))) {
-      return problem(reply, 403, "Forbidden", "Bot verification failed.");
-    }
 
     const ipHash = hashIp(request.ip, config.DATA_ENCRYPTION_KEY);
     const limited = limiter.check(`${form.publicKey}:${ipHash}`);

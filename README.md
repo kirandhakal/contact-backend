@@ -75,7 +75,9 @@ the frontend displays a countdown and disables submission until it expires.
 
 ### Email-verified signup and password reset
 
-Tenant signup now creates a pending account and sends a six-digit code. The
+Tenant signup now creates a pending account and sends a six-digit code. When
+`TURNSTILE_SECRET_KEY` is configured, `POST /v1/auth/signup` also requires a
+valid `Turnstile-Token` header to prevent automated workspace creation. The
 account and workspace are only created after `POST /v1/auth/signup/verify`
 accepts the correct code. Successful verification redirects the web app to
 `/login?signup=complete`; it does not attempt an automatic login.

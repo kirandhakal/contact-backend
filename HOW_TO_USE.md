@@ -33,7 +33,7 @@ TURNSTILE_SECRET_KEY=
 ```
 
 `ADMIN_API_KEY` is used for admin requests. `DATA_ENCRYPTION_KEY` must be exactly 64 hexadecimal characters.
-Set `TURNSTILE_SECRET_KEY` in production to require Cloudflare Turnstile verification for every submission.
+Set `TURNSTILE_SECRET_KEY` in production to require Cloudflare Turnstile verification when creating a tenant (signup) and for website contact messages. Submitted tenant forms do not require a token.
 
 ## 3. Start PostgreSQL
 
@@ -148,21 +148,7 @@ curl -X POST http://localhost:3100/v1/forms/YOUR_PUBLIC_KEY/submissions \
   }'
 ```
 
-Expected response status is `202 Accepted` for a new submission.
-
-If `TURNSTILE_SECRET_KEY` is set, submissions must also include a valid Turnstile token:
-
-```bash
-curl -X POST http://localhost:3100/v1/forms/YOUR_PUBLIC_KEY/submissions \
-  -H "Origin: http://localhost:8080" \
-  -H "Content-Type: application/json" \
-  -H "Turnstile-Token: TOKEN_FROM_FRONTEND_WIDGET" \
-  -d '{
-    "name": "Test User",
-    "email": "test@example.com",
-    "topic": "support"
-  }'
-```
+Expected response status is `202 Accepted` for a new submission. Tenant form submissions do not require a Turnstile token, even when `TURNSTILE_SECRET_KEY` is configured.
 
 ## 9. Use The Example HTML Form
 
@@ -271,11 +257,13 @@ The browser origin must exactly match one of the values in `allowedOrigins`. For
 
 ### Bot verification failed
 
-If `TURNSTILE_SECRET_KEY` is set, your frontend must render a Cloudflare Turnstile widget and send the returned token in this request header:
+If `TURNSTILE_SECRET_KEY` is set, tenant signup (`POST /v1/auth/signup`) and website contact messages (`POST /v1/site-contact`) must send a Cloudflare Turnstile token in this request header:
 
 ```text
 Turnstile-Token: TOKEN_FROM_FRONTEND_WIDGET
 ```
+
+Tenant form submissions do not require this header.
 
 ### Database not ready
 
