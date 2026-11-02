@@ -2,6 +2,7 @@ node_modules/
 dist/
 .env
 .env.docker
+.env.test
 !.env.docker.example
 coverage/
 *.log
