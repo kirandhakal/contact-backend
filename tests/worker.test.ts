@@ -11,9 +11,29 @@ function store() {
     deleteExpiredAuthData: vi.fn().mockResolvedValue(0),
     claimJobs: vi.fn().mockResolvedValue([]),
     markJobDelivered: vi.fn().mockResolvedValue(undefined),
-    markJobFailed: vi.fn().mockResolvedValue(undefined)
+    markJobFailed: vi.fn().mockResolvedValue(undefined),
+    claimSiteContactJobs: vi.fn().mockResolvedValue([]),
+    markSiteContactJobDelivered: vi.fn().mockResolvedValue(undefined),
+    markSiteContactJobFailed: vi.fn().mockResolvedValue(undefined)
   };
 }
+
+describe("worker website auto-replies", () => {
+  it("claims website jobs and records delivery failures", async () => {
+    const fake = store();
+    fake.claimSiteContactJobs.mockResolvedValueOnce([{
+      id: "job-1", attempts: 0,
+      submission: { id: "message-1", tenantId: "", formId: "site-contact", formVersion: 1, payload: { name: "Alex", email: "alex@example.com", message: "Hello" }, status: "accepted", sourceIpHash: "", expiresAt: "", createdAt: "" },
+      form: { id: "site-contact", name: "Website contact" },
+      destination: { id: "destination-1", formId: "site-contact", kind: "email", config: { to: "alex@example.com", template: "Hi {{name}}" }, active: true }
+    }]);
+    const tick = createWorkerTick(fake, config, now);
+    await tick();
+    expect(fake.claimSiteContactJobs).toHaveBeenCalledTimes(1);
+    expect(fake.markSiteContactJobFailed).toHaveBeenCalledWith("job-1", 1, expect.stringContaining("SMTP"));
+    expect(fake.markSiteContactJobDelivered).not.toHaveBeenCalled();
+  });
+});
 
 describe("worker cleanup", () => {
   it("logs cleanup failures and retries cleanup before claiming jobs", async () => {

@@ -65,6 +65,15 @@ class MemoryStore implements Store {
   }
   async listSiteContacts(page: number, limit: number) { return { messages: [...this.siteContacts.values()].slice((page - 1) * limit, page * limit), total: this.siteContacts.size }; }
   async deleteSiteContact(id: string) { for (const [key, item] of this.siteContacts) if (item.id === id) return this.siteContacts.delete(key); return false; }
+  siteContactDestinations: import("../src/types.js").DestinationRecord[] = [];
+  async getSiteContactDestinations() { return this.siteContactDestinations; }
+  async updateSiteContactDestinations(destinations: import("../src/types.js").DestinationInput[]) {
+    this.siteContactDestinations = destinations.map((destination) => ({ id: randomUUID(), formId: "site-contact", kind: destination.kind, config: destination.config, secret: destination.secret ?? null, active: true }));
+  }
+  async claimSiteContactJobs(): Promise<OutboxJob[]> { return []; }
+  async markSiteContactJobDelivered() {}
+  async markSiteContactJobFailed() {}
+  async siteContactDeliveryStatus() { return []; }
 
   async findReplySubmissions(key: string) { return this.submissions.filter(s => s.formId === this.forms.get(key)?.id && s.status === "accepted").map(s => s.id); }
   async queueReplies(_key: string, ids: string[], destinations: string[], _message: string, _requestId: string) { return ids.length * destinations.length; }
@@ -1310,6 +1319,25 @@ describe("website contact inbox", () => {
       const headers = { authorization: `Bearer ${config.ADMIN_API_KEY}`, origin: config.PUBLIC_BASE_URL };
       expect((await app.inject({ method: "DELETE", url: `/v1/admin/site-contact/${id}`, headers })).statusCode).toBe(200);
       expect(store.siteContacts.size).toBe(0);
+    } finally { await app.close(); }
+  });
+  it("manages website auto-reply integrations without exposing secrets", async () => {
+    const store = new MemoryStore(); const app = makeApp(store);
+    const headers = { authorization: `Bearer ${config.ADMIN_API_KEY}`, origin: config.PUBLIC_BASE_URL };
+    try {
+      const email = { kind: "email", secret: "smtp-password", config: { to: "visitor@example.com", from: "hello@example.com", smtpHost: "smtp.example.com", smtpPort: 587, smtpUser: "hello@example.com", subject: "Thanks {{name}}", template: "Hi {{name}}, we received: {{message}}" } };
+      expect((await app.inject({ method: "PATCH", url: "/v1/admin/site-contact/integrations", headers, payload: { destinations: [email] } })).statusCode).toBe(200);
+      expect(store.siteContactDestinations).toHaveLength(1);
+      const saved = await app.inject({ url: "/v1/admin/site-contact/integrations", headers });
+      expect(saved.statusCode).toBe(200);
+      expect(saved.json().destinations[0]).toMatchObject({ kind: "email", hasSecret: true, config: { deliveryMode: "automatic" } });
+      expect(JSON.stringify(saved.json())).not.toContain("smtp-password");
+      const edited = { ...email, id: store.siteContactDestinations[0].id, secret: undefined };
+      expect((await app.inject({ method: "PATCH", url: "/v1/admin/site-contact/integrations", headers, payload: { destinations: [edited] } })).statusCode).toBe(200);
+      expect(store.siteContactDestinations[0].secret).toBe("smtp-password");
+      const manual = { ...email, id: undefined, secret: undefined, config: { ...email.config, deliveryMode: "manual" } };
+      expect((await app.inject({ method: "PATCH", url: "/v1/admin/site-contact/integrations", headers, payload: { destinations: [manual] } })).statusCode).toBe(422);
+      expect((await app.inject({ url: "/v1/admin/site-contact/integrations", headers: { origin: config.PUBLIC_BASE_URL } })).statusCode).toBe(401);
     } finally { await app.close(); }
   });
   it("requires Turnstile verification when configured", async () => {

@@ -1,4 +1,4 @@
-import { validateDestinations } from "./integrations.js";
+import { siteContactSchema, validateDestinations } from "./integrations.js";
 import { randomUUID } from "node:crypto";
 import multipart from "@fastify/multipart";
 import { uploadFile } from "./storage.js";
@@ -26,7 +26,7 @@ import {
   newPublicKey,
   newSubmissionAccessToken
 } from "./security.js";
-import type { AdminRole, AuthChallenge, CreateFormInput, JsonObject, Store, TenantLimits } from "./types.js";
+import type { AdminRole, AuthChallenge, CreateFormInput, DestinationInput, JsonObject, Store, TenantLimits } from "./types.js";
 
 const GENERIC_AUTH_MESSAGE = "We've received your request. If the email is eligible, you will receive a verification code shortly.";
 
@@ -307,6 +307,43 @@ export function buildApp(config: AppConfig, store: Store, dependencies: AppDepen
     if (!z.string().uuid().safeParse(request.params.id).success) return problem(reply, 422, "Invalid request", "Invalid message ID.");
     if (!await store.deleteSiteContact(request.params.id)) return problem(reply, 404, "Not found", "Message not found.");
     return { deleted: true };
+  });
+
+  app.get("/v1/admin/site-contact/integrations", async (request, reply) => {
+    const actor = await adminFor(request);
+    if (!actor) return problem(reply, 401, "Unauthorized", "Sign in to continue.");
+    if (actor.role === "tenant") return problem(reply, 403, "Forbidden", "Only service administrators can manage website auto-replies.");
+    reply.header("Cache-Control", "no-store");
+    const destinations = await store.getSiteContactDestinations();
+    return { destinations: destinations.map(({ id, kind, config, secret }) => ({ id, kind, config, hasSecret: !!secret })) };
+  });
+
+  app.patch("/v1/admin/site-contact/integrations", async (request, reply) => {
+    const actor = await adminFor(request);
+    if (!actor) return problem(reply, 401, "Unauthorized", "Sign in to continue.");
+    if (actor.role === "tenant") return problem(reply, 403, "Forbidden", "Only service administrators can manage website auto-replies.");
+    if (!sameOrigin(request) && actor.id !== "service-key") return problem(reply, 403, "Forbidden", "Invalid origin.");
+    if (!assertPlainObject(request.body) || !Array.isArray(request.body.destinations)) return problem(reply, 422, "Invalid integration", "Supply a list of integrations.");
+    let destinations: DestinationInput[];
+    try {
+      destinations = validateDestinations(request.body.destinations, siteContactSchema, await store.getSiteContactDestinations());
+    } catch (error) {
+      return problem(reply, 422, "Invalid integration", error instanceof z.ZodError ? "Check integration settings, recipients, and templates." : (error as Error).message);
+    }
+    if (destinations.some(destination => destination.config.deliveryMode === "manual")) {
+      return problem(reply, 422, "Invalid integration", "Website auto-replies must be automatic.");
+    }
+    destinations = destinations.map(destination => ({ ...destination, config: { ...destination.config, deliveryMode: "automatic" } }));
+    await store.updateSiteContactDestinations(destinations);
+    return { saved: destinations.length };
+  });
+
+  app.get<{ Params: { id: string } }>("/v1/admin/site-contact/:id/delivery", async (request, reply) => {
+    const actor = await adminFor(request);
+    if (!actor) return problem(reply, 401, "Unauthorized", "Sign in to continue.");
+    if (actor.role === "tenant") return problem(reply, 403, "Forbidden", "Only service administrators can read website delivery status.");
+    if (!z.string().uuid().safeParse(request.params.id).success) return problem(reply, 422, "Invalid request", "Invalid message ID.");
+    return { deliveries: await store.siteContactDeliveryStatus(request.params.id) };
   });
 
   app.get("/health/live", async () => ({ status: "ok" }));

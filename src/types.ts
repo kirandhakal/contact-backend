@@ -197,6 +197,12 @@ export interface Store {
   saveSiteContact(input: { name: string; email: string; message: string }, key: string): Promise<void>;
   listSiteContacts(page: number, limit: number): Promise<{ messages: SiteContactMessage[]; total: number }>;
   deleteSiteContact(id: string): Promise<boolean>;
+  getSiteContactDestinations(): Promise<DestinationRecord[]>;
+  updateSiteContactDestinations(destinations: DestinationInput[]): Promise<void>;
+  claimSiteContactJobs(limit: number): Promise<OutboxJob[]>;
+  markSiteContactJobDelivered(id: string): Promise<void>;
+  markSiteContactJobFailed(id: string, attempts: number, error: string): Promise<void>;
+  siteContactDeliveryStatus(messageId: string): Promise<JsonObject[]>;
   findReplySubmissions(publicKey: string, filters: import("./management.js").ReplyFilters): Promise<string[]>;
   queueReplies(publicKey: string, submissionIds: string[], destinationIds: string[], message: string, requestId: string, subject?: string): Promise<number>;
   deliveryStatus(publicKey: string, submissionId: string): Promise<JsonObject[]>;

@@ -40,6 +40,23 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)("PostgreSQL management integrati
     expect(await store.deleteSiteContact(result.messages[0].id)).toBe(true);
     expect((await store.listSiteContacts(1, 20)).total).toBe(0);
   });
+  it("queues and claims automatic website auto-replies", async () => {
+    try {
+      await store.updateSiteContactDestinations([{ kind: "email", config: { to: "visitor@example.com", subject: "Thanks {{name}}", template: "Hi {{name}}, we received: {{message}}" } }]);
+      const message = { name: "Auto reply visitor", email: "auto@example.com", message: "Please reply to this message." };
+      await store.saveSiteContact(message, randomUUID());
+      const jobs = await store.claimSiteContactJobs(10);
+      expect(jobs).toHaveLength(1);
+      expect(jobs[0]).toMatchObject({ form: { id: "site-contact", name: "Website contact" }, destination: { kind: "email" }, submission: { payload: message } });
+      await store.markSiteContactJobDelivered(jobs[0].id);
+      expect(await store.siteContactDeliveryStatus(jobs[0].submission.id)).toMatchObject([{ kind: "email", status: "delivered", error: null }]);
+      const saved = await store.listSiteContacts(1, 20);
+      for (const item of saved.messages) await store.deleteSiteContact(item.id);
+      expect(await store.claimSiteContactJobs(10)).toEqual([]);
+    } finally {
+      await store.updateSiteContactDestinations([]);
+    }
+  });
   it("reproduces login failure without the lockout migration and repairs signup/login by migrating", async () => {
     const config = getConfig({ NODE_ENV: "test", DATABASE_URL: pool.options.connectionString!,
       ADMIN_API_KEY: "test-admin-key-at-least-24-characters", DATA_ENCRYPTION_KEY: "a".repeat(64), PUBLIC_BASE_URL: "http://localhost:3100" });

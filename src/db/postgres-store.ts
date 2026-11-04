@@ -9,6 +9,7 @@ import { z } from "zod";
 import type {
   CreateFormInput,
   AdminRole,
+  DestinationInput,
   DestinationRecord,
   FormSummary,
   FormRecord,
@@ -74,8 +75,26 @@ function mapDestination(row: pg.QueryResultRow, key: string): DestinationRecord 
 
 export class PostgresStore implements Store {
   async saveSiteContact(input: { name: string; email: string; message: string }, key: string) {
-    await this.pool.query(`INSERT INTO site_contact_messages(name,email,message,idempotency_key)
-      VALUES ($1,$2,$3,$4) ON CONFLICT (idempotency_key) DO NOTHING`, [input.name, input.email, input.message, key]);
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const inserted = await client.query(`INSERT INTO site_contact_messages(name,email,message,idempotency_key)
+        VALUES ($1,$2,$3,$4) ON CONFLICT (idempotency_key) DO NOTHING RETURNING id`, [input.name, input.email, input.message, key]);
+      if (inserted.rowCount) {
+        const destinations = await client.query("SELECT * FROM site_contact_destinations WHERE active=true ORDER BY id");
+        for (const row of destinations.rows) {
+          const destination = mapDestination({ ...row, form_id: "site-contact" }, this.encryptionKey);
+          if (destination.config.deliveryMode === "manual") continue;
+          await client.query("INSERT INTO site_contact_outbox_jobs(message_id,destination_id) VALUES($1,$2)", [inserted.rows[0].id, row.id]);
+        }
+      }
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
   }
   async listSiteContacts(page: number, limit: number) {
     const { rows } = await this.pool.query(`SELECT id,name,email,message,created_at AS "createdAt"
@@ -85,6 +104,101 @@ export class PostgresStore implements Store {
   }
   async deleteSiteContact(id: string) {
     return (await this.pool.query("DELETE FROM site_contact_messages WHERE id=$1", [id])).rowCount === 1;
+  }
+
+  async getSiteContactDestinations(): Promise<DestinationRecord[]> {
+    const result = await this.pool.query("SELECT * FROM site_contact_destinations WHERE active=true ORDER BY id");
+    return result.rows.map(row => mapDestination({ ...row, form_id: "site-contact" }, this.encryptionKey));
+  }
+
+  async updateSiteContactDestinations(destinations: DestinationInput[]): Promise<void> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("UPDATE site_contact_destinations SET active=false WHERE active=true");
+      for (const destination of destinations) {
+        await client.query("INSERT INTO site_contact_destinations(kind,config,secret,active) VALUES($1,$2,NULL,true)",
+          [destination.kind, encryptDestination(destination, this.encryptionKey)]);
+      }
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async claimSiteContactJobs(limit: number): Promise<OutboxJob[]> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const result = await client.query(
+        `WITH claimed AS (
+          SELECT j.id,j.attempts,m.id AS message_id,m.name,m.email,m.message,m.created_at,
+            d.id AS destination_id,d.kind,d.config,d.secret,d.active
+          FROM site_contact_outbox_jobs j
+          JOIN site_contact_messages m ON m.id=j.message_id
+          JOIN site_contact_destinations d ON d.id=j.destination_id
+          WHERE j.status IN ('pending','failed') AND j.available_at <= now()
+          ORDER BY j.available_at ASC LIMIT $1 FOR UPDATE OF j SKIP LOCKED
+        )
+        UPDATE site_contact_outbox_jobs j SET status='processing',updated_at=now()
+        FROM claimed WHERE j.id=claimed.id
+        RETURNING j.id,claimed.attempts,claimed.message_id,claimed.name,claimed.email,claimed.message,claimed.created_at,
+          claimed.destination_id,claimed.kind,claimed.config,claimed.secret,claimed.active`,
+        [limit]
+      );
+      const jobs = result.rows.map((row) => {
+        const createdAt = row.created_at instanceof Date ? row.created_at.toISOString() : String(row.created_at);
+        return {
+          id: row.id,
+          attempts: Number(row.attempts),
+          submission: {
+            id: row.message_id,
+            tenantId: "",
+            formId: "site-contact",
+            formVersion: 1,
+            payload: { name: row.name, email: row.email, message: row.message },
+            status: "accepted" as const,
+            sourceIpHash: "",
+            expiresAt: createdAt,
+            createdAt
+          },
+          form: { id: "site-contact", name: "Website contact" },
+          destination: mapDestination({ ...row, form_id: "site-contact" }, this.encryptionKey)
+        };
+      });
+      await client.query("COMMIT");
+      return jobs;
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async markSiteContactJobDelivered(id: string): Promise<void> {
+    await this.pool.query("UPDATE site_contact_outbox_jobs SET status='delivered',updated_at=now() WHERE id=$1", [id]);
+  }
+
+  async markSiteContactJobFailed(id: string, attempts: number, error: string): Promise<void> {
+    const dead = attempts >= 8;
+    const delaySeconds = Math.min(3600, 10 * 2 ** Math.max(0, attempts - 1));
+    await this.pool.query(
+      `UPDATE site_contact_outbox_jobs
+       SET status=$2,attempts=$3,available_at=now()+($4 || ' seconds')::interval,last_error=$5,updated_at=now()
+       WHERE id=$1`,
+      [id, dead ? "dead" : "failed", attempts, delaySeconds, error.slice(0, 1000)]
+    );
+  }
+
+  async siteContactDeliveryStatus(messageId: string): Promise<JsonObject[]> {
+    const result = await this.pool.query(`SELECT j.id,d.kind,j.status,j.attempts,j.last_error
+      FROM site_contact_outbox_jobs j JOIN site_contact_destinations d ON d.id=j.destination_id
+      WHERE j.message_id=$1 ORDER BY j.created_at`, [messageId]);
+    return result.rows.map(({ last_error, ...row }) => ({ ...row, error: row.status === "delivered" ? null : publicDeliveryError(last_error) }));
   }
 
   async withLoginState<T>(key: string, action: (state: import("../login-lockout.js").LoginState) => Promise<T>): Promise<T> {

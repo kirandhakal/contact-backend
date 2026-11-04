@@ -1,11 +1,25 @@
 import type { AppConfig } from "./config.js";
 import { deliverJob } from "./delivery.js";
-import type { Store } from "./types.js";
+import type { OutboxJob, Store } from "./types.js";
 
-type WorkerStore = Pick<Store, "deleteExpiredSubmissions" | "deleteExpiredAuthData" | "claimJobs" | "markJobDelivered" | "markJobFailed">;
+type WorkerStore = Pick<Store, "deleteExpiredSubmissions" | "deleteExpiredAuthData" | "claimJobs" | "markJobDelivered" | "markJobFailed" | "claimSiteContactJobs" | "markSiteContactJobDelivered" | "markSiteContactJobFailed">;
 
 export function createWorkerTick(store: WorkerStore, config: AppConfig, now = () => Date.now()) {
   let lastCleanup = 0;
+
+  async function deliver(jobs: OutboxJob[], markDelivered: (id: string) => Promise<void>, markFailed: (id: string, attempts: number, error: string) => Promise<void>) {
+    for (const job of jobs) {
+      const attempts = job.attempts + 1;
+      try {
+        await deliverJob(job, config);
+        await markDelivered(job.id);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        await markFailed(job.id, attempts, message);
+      }
+    }
+  }
+
   return async function tick() {
     const timestamp = now();
     if (timestamp - lastCleanup > 24 * 60 * 60 * 1000) {
@@ -14,17 +28,8 @@ export function createWorkerTick(store: WorkerStore, config: AppConfig, now = ()
       lastCleanup = timestamp;
     }
 
-    const jobs = await store.claimJobs(10);
-    for (const job of jobs) {
-      const attempts = job.attempts + 1;
-      try {
-        await deliverJob(job, config);
-        await store.markJobDelivered(job.id);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        await store.markJobFailed(job.id, attempts, message);
-      }
-    }
+    await deliver(await store.claimJobs(10), store.markJobDelivered.bind(store), store.markJobFailed.bind(store));
+    await deliver(await store.claimSiteContactJobs(10), store.markSiteContactJobDelivered.bind(store), store.markSiteContactJobFailed.bind(store));
   };
 }
 

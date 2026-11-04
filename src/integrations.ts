@@ -3,6 +3,16 @@ import { z } from "zod";
 import { isSafeWebhookUrl } from "./security.js";
 import type { DestinationInput, DestinationRecord, JsonObject, OutboxJob } from "./types.js";
 
+export const siteContactSchema: JsonObject = {
+  type: "object",
+  required: ["name", "email", "message"],
+  properties: {
+    name: { type: "string" },
+    email: { type: "string", format: "email" },
+    message: { type: "string" }
+  }
+};
+
 const text = z.string().trim().min(1);
 const field = text.max(80).regex(/^[a-zA-Z][a-zA-Z0-9_]*$/);
 const phone = z.string().regex(/^\+[1-9]\d{7,14}$/);
