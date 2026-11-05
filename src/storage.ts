@@ -2,6 +2,7 @@ import { createHash, createHmac } from "node:crypto";
 import * as objectstorage from "oci-objectstorage";
 import * as common from "oci-common";
 import { getConfig, type AppConfig } from "./config.js";
+import { sanitizeUploadFilename } from "./upload-validation.js";
 
 let client: objectstorage.ObjectStorageClient | null = null;
 
@@ -104,7 +105,8 @@ export async function uploadFile(file: Buffer, fileName: string, contentType: st
   const config = getConfig();
   requireStorageConfig(config);
 
-  const uniqueFileName = `${Date.now()}-${Math.random().toString(36).substring(2)}-${fileName.replace(/[^a-zA-Z0-9.-]/g, "_")}`;
+  const safeName = sanitizeUploadFilename(fileName);
+  const uniqueFileName = `${Date.now()}-${Math.random().toString(36).substring(2, 10)}-${safeName}`;
   const type = contentType || "application/octet-stream";
 
   if (hasApiKeyCredentials(config)) {

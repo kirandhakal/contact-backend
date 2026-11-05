@@ -30,7 +30,11 @@ const EnvSchema = z.object({
     return value;
   }, z.union([z.boolean(), z.string()])).default(false),
   PUBLIC_BASE_URL: z.string().url().default("http://localhost:3100"),
+  /** JSON / non-multipart request body limit. Keep low; do not raise for file uploads. */
   MAX_BODY_BYTES: z.coerce.number().int().positive().default(65536),
+  /** Multipart file upload limit in megabytes (applied to the file itself). */
+  MAX_FILE_SIZE_MB: z.coerce.number().int().positive().max(100).default(10),
+  MAX_FILES_PER_REQUEST: z.coerce.number().int().positive().max(20).default(1),
   RATE_LIMIT_WINDOW_SECONDS: z.coerce.number().int().positive().default(60),
   RATE_LIMIT_MAX: z.coerce.number().int().positive().default(20),
   RETENTION_DAYS: z.coerce.number().int().positive().default(90),

@@ -2,6 +2,7 @@ import { siteContactSchema, validateDestinations } from "./integrations.js";
 import { randomUUID } from "node:crypto";
 import multipart from "@fastify/multipart";
 import { uploadFile } from "./storage.js";
+import { validateUploadedFile } from "./upload-validation.js";
 import { generateOtp, hashOtp, hashResetToken, isSixDigitCode, newResetToken, normalizeEmail } from "./auth-otp.js";
 import { sendAuthEmail, type AuthEmailMessage } from "./auth-email.js";
 import { formSlug, tenantSlug } from "./tenant-name.js";
@@ -11,7 +12,7 @@ import { z } from "zod";
 import { listQuery, replyFilters } from "./management.js";
 import { Ajv2020, type ErrorObject } from "ajv/dist/2020.js";
 import type { FormatsPlugin } from "ajv-formats";
-import Fastify, { type FastifyError, type FastifyReply } from "fastify";
+import Fastify, { type FastifyError, type FastifyReply, type FastifyRequest } from "fastify";
 import { hashPassword, hashSessionToken, newSessionToken, verifyPassword } from "./admin-auth.js";
 import type { AppConfig } from "./config.js";
 import { FixedWindowRateLimiter } from "./rate-limit.js";
@@ -166,6 +167,11 @@ const schemaAjv = new Ajv2020({ allErrors: true, strict: false, validateSchema: 
 addFormats(schemaAjv);
 
 export function buildApp(config: AppConfig, store: Store, dependencies: AppDependencies = {}) {
+  const maxFileSizeBytes = Number(config.MAX_FILE_SIZE_MB || 10) * 1024 * 1024;
+  const maxFilesPerRequest = Number(config.MAX_FILES_PER_REQUEST || 1);
+  // Multipart framing/headers add overhead beyond the raw file; keep JSON bodyLimit separate.
+  const uploadBodyLimit = maxFileSizeBytes + 1024 * 1024;
+
   const app = Fastify({
     logger: config.NODE_ENV === "test" ? false : true,
     bodyLimit: config.MAX_BODY_BYTES,
@@ -236,13 +242,36 @@ export function buildApp(config: AppConfig, store: Store, dependencies: AppDepen
 
   app.register(multipart, {
     limits: {
-      fileSize: 50 * 1024 * 1024, // 50MB default
+      fileSize: maxFileSizeBytes,
+      files: maxFilesPerRequest,
+      fields: 10,
+      parts: maxFilesPerRequest + 10
     }
   });
 
-  app.setErrorHandler((error: FastifyError, _request, reply) => {
-    if (error.statusCode === 413) {
-      void problem(reply, 413, "Payload too large", "Request body exceeds the configured limit.");
+  app.setErrorHandler((error: FastifyError, request, reply) => {
+    const code = typeof error.code === "string" ? error.code : undefined;
+    if (error.statusCode === 413 || code === "FST_REQ_FILE_TOO_LARGE" || code === "FST_ERR_CTP_BODY_TOO_LARGE") {
+      const isUpload = request.url.includes("/upload");
+      const isFileLimit = code === "FST_REQ_FILE_TOO_LARGE";
+      app.log.warn({
+        event: "upload_rejected",
+        reason: isFileLimit ? "multipart_file_limit" : "request_body_limit",
+        code,
+        path: request.url,
+        contentLength: request.headers["content-length"]
+      }, isFileLimit ? "Multipart file exceeded configured limit" : "Request body exceeded configured limit");
+      void problem(
+        reply,
+        413,
+        "Payload too large",
+        isFileLimit
+          ? "Uploaded file exceeds the configured maximum size."
+          : isUpload
+            ? "Upload request exceeds the configured maximum size."
+            : "Request body exceeds the configured limit.",
+        { code: isFileLimit ? "FILE_TOO_LARGE" : "BODY_TOO_LARGE" }
+      );
       return;
     }
     if (error.validation) {
@@ -991,21 +1020,119 @@ export function buildApp(config: AppConfig, store: Store, dependencies: AppDepen
     return reply.code(202).send({ message: ids ? `Test submission saved with the same field data. ${queued} selected integration messages queued.` : "Test submission saved. Automatic messages are queued; check delivery status below.", submissionId: result.submission.id });
   });
 
-  app.post<{ Params: { publicKey: string } }>("/v1/admin/forms/:publicKey/upload", async (request, reply) => {
+  async function processMediaUpload(
+    request: FastifyRequest,
+    reply: FastifyReply,
+    context: { route: "admin" | "public"; publicKey: string }
+  ) {
+    request.log.info({
+      event: "upload_received",
+      route: context.route,
+      publicKey: context.publicKey,
+      contentLength: request.headers["content-length"],
+      maxFileSizeBytes
+    }, "Upload request received");
+
+    let data: Awaited<ReturnType<typeof request.file>>;
+    try {
+      data = await request.file();
+    } catch (error) {
+      const err = error as FastifyError;
+      if (err.statusCode === 413 || err.code === "FST_REQ_FILE_TOO_LARGE" || err.code === "FST_ERR_CTP_BODY_TOO_LARGE") {
+        throw error;
+      }
+      request.log.warn({ event: "upload_validation_failed", reason: "malformed_multipart", route: context.route }, "Malformed multipart upload");
+      return problem(reply, 400, "Bad request", "Malformed multipart upload.");
+    }
+
+    if (!data) {
+      request.log.warn({ event: "upload_validation_failed", reason: "missing_file", route: context.route }, "Upload missing file part");
+      return problem(reply, 400, "Bad request", "No file uploaded.");
+    }
+
+    let buffer: Buffer;
+    try {
+      buffer = await data.toBuffer();
+    } catch (error) {
+      const err = error as FastifyError;
+      if (err.statusCode === 413 || err.code === "FST_REQ_FILE_TOO_LARGE") {
+        throw error;
+      }
+      request.log.warn({ event: "upload_validation_failed", reason: "read_failed", route: context.route }, "Failed to read uploaded file");
+      return problem(reply, 400, "Bad request", "Unable to read uploaded file.");
+    }
+
+    if (data.file.truncated) {
+      request.log.warn({
+        event: "upload_validation_failed",
+        reason: "multipart_file_limit",
+        route: context.route,
+        mimetype: data.mimetype,
+        size: buffer.length
+      }, "Multipart file exceeded configured limit");
+      return problem(reply, 413, "Payload too large", "Uploaded file exceeds the configured maximum size.", {
+        code: "FILE_TOO_LARGE"
+      });
+    }
+
+    const validated = validateUploadedFile({
+      filename: data.filename,
+      mimetype: data.mimetype,
+      buffer,
+      maxFileSizeBytes
+    });
+    if (!validated.ok) {
+      request.log.warn({
+        event: "upload_validation_failed",
+        reason: validated.code,
+        route: context.route,
+        mimetype: data.mimetype,
+        size: buffer.length
+      }, "Upload validation failed");
+      return problem(reply, validated.status, validated.title, validated.detail, { code: validated.code });
+    }
+
+    request.log.info({
+      event: "oci_upload_started",
+      route: context.route,
+      publicKey: context.publicKey,
+      mimetype: validated.mime,
+      size: buffer.length
+    }, "OCI upload started");
+
+    try {
+      const url = await uploadFile(buffer, validated.filename, validated.mime);
+      request.log.info({
+        event: "oci_upload_completed",
+        route: context.route,
+        publicKey: context.publicKey,
+        mimetype: validated.mime,
+        size: buffer.length
+      }, "OCI upload completed");
+      return { url, filename: validated.filename, mimetype: validated.mime, size: buffer.length };
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "unknown";
+      request.log.error({
+        event: "oci_upload_failed",
+        route: context.route,
+        publicKey: context.publicKey,
+        mimetype: validated.mime,
+        size: buffer.length,
+        reason: reason.slice(0, 200)
+      }, "OCI upload failed");
+      return problem(reply, 502, "Upload failed", "Object storage could not store the file. Please try again shortly.", {
+        code: "OCI_UPLOAD_FAILED"
+      });
+    }
+  }
+
+  app.post<{ Params: { publicKey: string } }>("/v1/admin/forms/:publicKey/upload", { bodyLimit: uploadBodyLimit }, async (request, reply) => {
     const actor = await adminFor(request);
     if (!actor) return problem(reply, 401, "Unauthorized", "Sign in required.");
     if (!sameOrigin(request) && actor.id !== "service-key") return problem(reply, 403, "Forbidden", "Invalid origin.");
     const form = await store.getForm(request.params.publicKey);
     if (!form || (actor.role === "tenant" && actor.tenantId !== form.tenantId)) return problem(reply, 404, "Not found", "Form not found.");
-    try {
-      const data = await request.file();
-      if (!data) return problem(reply, 400, "Bad request", "No file uploaded.");
-      const buffer = await data.toBuffer();
-      const url = await uploadFile(buffer, data.filename, data.mimetype);
-      return { url, filename: data.filename, mimetype: data.mimetype, size: buffer.length };
-    } catch (error: any) {
-      return problem(reply, 500, "Upload failed", error.message || "Failed to upload file.");
-    }
+    return processMediaUpload(request, reply, { route: "admin", publicKey: form.publicKey });
   });
 
   app.get<{ Params: { publicKey: string; submissionId: string } }>("/v1/admin/forms/:publicKey/delivery/:submissionId", async (request, reply) => {
@@ -1123,23 +1250,14 @@ export function buildApp(config: AppConfig, store: Store, dependencies: AppDepen
   });
 
   // File upload endpoint for forms
-  app.post<{ Params: { publicKey: string } }>("/v1/forms/:publicKey/upload", async (request, reply) => {
+  app.post<{ Params: { publicKey: string } }>("/v1/forms/:publicKey/upload", { bodyLimit: uploadBodyLimit }, async (request, reply) => {
     const form = await store.getActiveForm(request.params.publicKey);
     if (!form) return problem(reply, 404, "Not found", "Form not found or disabled.");
     if (!isAllowedOrigin(request.headers.origin, form.allowedOrigins)) {
       return problem(reply, 403, "Forbidden", "Origin is not allowed for this form.");
     }
     applyCors(reply, request.headers.origin);
-
-    try {
-      const data = await request.file();
-      if (!data) return problem(reply, 400, "Bad request", "No file uploaded.");
-      const buffer = await data.toBuffer();
-      const url = await uploadFile(buffer, data.filename, data.mimetype);
-      return { url, filename: data.filename, mimetype: data.mimetype, size: buffer.length };
-    } catch (error: any) {
-      return problem(reply, 500, "Upload failed", error.message || "Failed to upload file.");
-    }
+    return processMediaUpload(request, reply, { route: "public", publicKey: form.publicKey });
   });
 
 
