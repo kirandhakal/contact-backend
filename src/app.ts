@@ -1,8 +1,18 @@
 import { siteContactSchema, validateDestinations } from "./integrations.js";
 import { randomUUID } from "node:crypto";
 import multipart from "@fastify/multipart";
-import { uploadFile } from "./storage.js";
+import { buildObjectKey, deleteFile, downloadFile, uploadFile } from "./storage.js";
 import { validateUploadedFile } from "./upload-validation.js";
+import {
+  extractMediaAttachments,
+  formHasMediaFields,
+  mediaFieldsFromSchema,
+  MediaReferenceError,
+  mediaTypeAllowed,
+  mediaUploadPolicy,
+  normalizeUploadConfig,
+  uploadResponse
+} from "./media.js";
 import { generateOtp, hashOtp, hashResetToken, isSixDigitCode, newResetToken, normalizeEmail } from "./auth-otp.js";
 import { sendAuthEmail, type AuthEmailMessage } from "./auth-email.js";
 import { formSlug, tenantSlug } from "./tenant-name.js";
@@ -146,6 +156,17 @@ const validateCreateForm = createFormAjv.compile({
     successMessage: { type: "string", minLength: 1, maxLength: 500 },
     honeypotField: { type: "string", minLength: 1, maxLength: 80 },
     schema: { type: "object" },
+    uploadConfig: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        enabled: { type: "boolean" },
+        maxSizeMB: { type: "number", minimum: 1, maximum: 100 },
+        allowedTypes: { type: "string", maxLength: 1000 },
+        uploadType: { enum: ["single", "multiple"] },
+        maxFiles: { type: "number", minimum: 1, maximum: 20 }
+      }
+    },
     destinations: {
       type: "array",
       maxItems: 20,
@@ -235,6 +256,13 @@ export function buildApp(config: AppConfig, store: Store, dependencies: AppDepen
     return typeof origin === "string" && origin === new URL(config.PUBLIC_BASE_URL).origin;
   }
 
+  // The platform's own hosted form runs on PUBLIC_BASE_URL, which may not be
+  // listed in a tenant's allowedOrigins. It is always safe to accept it.
+  function allowsOrigin(origin: string | undefined, allowed: string[]): boolean {
+    if (isAllowedOrigin(origin, allowed)) return true;
+    return typeof origin === "string" && origin === new URL(config.PUBLIC_BASE_URL).origin;
+  }
+
   app.addHook("onSend", async (request, reply) => {
     applySecurityHeaders(reply);
     if (request.url.startsWith("/v1/admin") || request.url.startsWith("/v1/auth")) reply.header("Cache-Control", "no-store");
@@ -292,7 +320,7 @@ export function buildApp(config: AppConfig, store: Store, dependencies: AppDepen
     const pathMatch = /^\/v1\/forms\/([^/]+)(?:\/submissions)?$/.exec(path);
     if (!origin || !pathMatch) return reply.code(403).send();
     const form = await store.getActiveForm(pathMatch[1]);
-    if (!form || !isAllowedOrigin(origin, form.allowedOrigins)) return reply.code(403).send();
+    if (!form || !allowsOrigin(origin, form.allowedOrigins)) return reply.code(403).send();
     applyCors(reply, origin);
     return reply.code(204).send();
   });
@@ -854,6 +882,7 @@ export function buildApp(config: AppConfig, store: Store, dependencies: AppDepen
       : body as CreateFormInput;
     input.tenantName = tenantSlug(input.tenantName);
     input.name = formSlug(input.name);
+    input.uploadConfig = normalizeUploadConfig(input.uploadConfig);
     if (!input.tenantId && (!input.tenantName || input.tenantName.length > 200)) return problem(reply, 422, "Invalid tenant name", "Use a workspace name that produces a non-empty slug of at most 200 characters.");
     if (!input.name || input.name.length > 200) return problem(reply, 422, "Invalid form name", "Use a form name that produces a non-empty slug of at most 200 characters.");
     for (const origin of input.allowedOrigins) {
@@ -901,7 +930,7 @@ export function buildApp(config: AppConfig, store: Store, dependencies: AppDepen
   app.get<{ Params: { publicKey: string } }>("/v1/forms/:publicKey", async (request, reply) => {
     const form = await store.getActiveForm(request.params.publicKey);
     if (!form) return problem(reply, 404, "Not found", "Form not found or disabled.");
-    if (!isAllowedOrigin(request.headers.origin, form.allowedOrigins)) {
+    if (!allowsOrigin(request.headers.origin, form.allowedOrigins)) {
       return problem(reply, 403, "Forbidden", "Origin is not allowed for this form.");
     }
     applyCors(reply, request.headers.origin);
@@ -970,6 +999,14 @@ export function buildApp(config: AppConfig, store: Store, dependencies: AppDepen
       if (!assertPlainObject(request.body.schema) || !isBoundedJsonSchema(request.body.schema) || !schemaAjv.validateSchema(request.body.schema)) return problem(reply, 422, "Validation failed", "JSON Schema is invalid or too complex.");
       changes.schema = request.body.schema;
     }
+    if (request.body.uploadConfig !== undefined) {
+      if (!assertPlainObject(request.body.uploadConfig)) return problem(reply, 422, "Invalid request", "Upload settings are invalid.");
+      const uploadConfig = normalizeUploadConfig(request.body.uploadConfig);
+      if (uploadConfig.maxSizeMB && uploadConfig.maxSizeMB > config.MAX_FILE_SIZE_MB) {
+        return problem(reply, 422, "Invalid request", `The maximum upload size cannot exceed ${config.MAX_FILE_SIZE_MB} MB on this server.`);
+      }
+      changes.uploadConfig = uploadConfig;
+    }
     if (request.body.destinations !== undefined) {
       const current = await store.getForm(request.params.publicKey);
       try { changes.destinations = validateDestinations(request.body.destinations, changes.schema ?? current!.schema, await store.getFormDestinations(request.params.publicKey)); }
@@ -1013,7 +1050,14 @@ export function buildApp(config: AppConfig, store: Store, dependencies: AppDepen
     const usage = await store.getTenantLimits(form.tenantId);
     if (usage && (usage.totalSubmissions >= usage.maxTotalSubmissions || usage.dailySubmissions >= usage.maxDailySubmissions)) return problem(reply, 429, "Limit reached", "Submission allowance reached.");
     if (!limiter.check(`admin-test:${actor.id}:${form.id}`).allowed) return problem(reply, 429, "Rate limit exceeded", "Too many test submissions.");
-    const result = await store.createSubmission({ form, payload, skipAutomatic: parsed.data.destinationIds !== undefined, status: "accepted", sourceOrigin: "admin-test", sourceIpHash: hashIp(request.ip, config.DATA_ENCRYPTION_KEY),
+    let media: ReturnType<typeof extractMediaAttachments>;
+    try {
+      media = extractMediaAttachments(form, payload);
+    } catch (error) {
+      if (error instanceof MediaReferenceError) return problem(reply, 422, "Invalid upload", error.message, { code: "INVALID_UPLOAD_REFERENCE" });
+      throw error;
+    }
+    const result = await store.createSubmission({ form, payload, media, skipAutomatic: parsed.data.destinationIds !== undefined, status: "accepted", sourceOrigin: "admin-test", sourceIpHash: hashIp(request.ip, config.DATA_ENCRYPTION_KEY),
       idempotencyKey: `test-${parsed.data.requestId}`, accessTokenHash: hashSubmissionAccessToken(newSubmissionAccessToken()), expiresAt: new Date(Date.now() + config.RETENTION_DAYS * 86400000) });
     const ids = parsed.data.destinationIds;
     const queued = ids?.length ? await store.queueReplies(form.publicKey, [result.submission.id], [...new Set(ids)], "", parsed.data.requestId) : 0;
@@ -1023,15 +1067,28 @@ export function buildApp(config: AppConfig, store: Store, dependencies: AppDepen
   async function processMediaUpload(
     request: FastifyRequest,
     reply: FastifyReply,
-    context: { route: "admin" | "public"; publicKey: string }
+    context: { route: "admin" | "public"; form: { id: string; tenantId: string; publicKey: string; schema: JsonObject; uploadConfig: import("./types.js").UploadConfig } }
   ) {
+    const { form } = context;
+    const policy = mediaUploadPolicy(form as never, maxFileSizeBytes);
     request.log.info({
       event: "upload_received",
       route: context.route,
-      publicKey: context.publicKey,
+      publicKey: form.publicKey,
       contentLength: request.headers["content-length"],
-      maxFileSizeBytes
+      maxFileSizeBytes: policy.maxSizeBytes
     }, "Upload request received");
+
+    if (!formHasMediaFields(form as never) || !policy.enabled) {
+      return problem(reply, 403, "Uploads disabled", "This form does not allow file uploads.");
+    }
+
+    const ipHash = hashIp(request.ip, config.DATA_ENCRYPTION_KEY);
+    const limited = limiter.check(`upload:${form.id}:${ipHash}`);
+    if (!limited.allowed) {
+      reply.header("Retry-After", limited.retryAfterSeconds);
+      return problem(reply, 429, "Too many uploads", "Please wait before uploading another file.");
+    }
 
     let data: Awaited<ReturnType<typeof request.file>>;
     try {
@@ -1079,7 +1136,7 @@ export function buildApp(config: AppConfig, store: Store, dependencies: AppDepen
       filename: data.filename,
       mimetype: data.mimetype,
       buffer,
-      maxFileSizeBytes
+      maxFileSizeBytes: policy.maxSizeBytes
     });
     if (!validated.ok) {
       request.log.warn({
@@ -1092,30 +1149,34 @@ export function buildApp(config: AppConfig, store: Store, dependencies: AppDepen
       return problem(reply, validated.status, validated.title, validated.detail, { code: validated.code });
     }
 
+    if (!mediaTypeAllowed(validated.filename, validated.mime, policy.allowedTypes)) {
+      return problem(reply, 400, "Unsupported file type", "This form does not accept that file type.", { code: "UNSUPPORTED_FILE_TYPE" });
+    }
+
+    const storageBytes = await store.getTenantStorageBytes(form.tenantId);
+    const quotaBytes = config.MAX_TENANT_STORAGE_MB * 1024 * 1024;
+    if (storageBytes + buffer.length > quotaBytes) {
+      return problem(reply, 413, "Storage quota reached", "This workspace has reached its media storage allowance.", { code: "STORAGE_QUOTA_EXCEEDED" });
+    }
+
+    const objectKey = buildObjectKey(form.tenantId, form.id, validated.filename);
     request.log.info({
       event: "oci_upload_started",
       route: context.route,
-      publicKey: context.publicKey,
+      publicKey: form.publicKey,
       mimetype: validated.mime,
       size: buffer.length
     }, "OCI upload started");
 
+    let stored: { objectKey: string; url: string };
     try {
-      const url = await uploadFile(buffer, validated.filename, validated.mime);
-      request.log.info({
-        event: "oci_upload_completed",
-        route: context.route,
-        publicKey: context.publicKey,
-        mimetype: validated.mime,
-        size: buffer.length
-      }, "OCI upload completed");
-      return { url, filename: validated.filename, mimetype: validated.mime, size: buffer.length };
+      stored = await uploadFile(buffer, objectKey, validated.mime);
     } catch (error) {
       const reason = error instanceof Error ? error.message : "unknown";
       request.log.error({
         event: "oci_upload_failed",
         route: context.route,
-        publicKey: context.publicKey,
+        publicKey: form.publicKey,
         mimetype: validated.mime,
         size: buffer.length,
         reason: reason.slice(0, 200)
@@ -1123,6 +1184,33 @@ export function buildApp(config: AppConfig, store: Store, dependencies: AppDepen
       return problem(reply, 502, "Upload failed", "Object storage could not store the file. Please try again shortly.", {
         code: "OCI_UPLOAD_FAILED"
       });
+    }
+
+    const expiresAt = new Date(Date.now() + config.UPLOAD_PENDING_TTL_SECONDS * 1000);
+    try {
+      const upload = await store.createUpload({
+        tenantId: form.tenantId,
+        formId: form.id,
+        objectKey: stored.objectKey,
+        url: stored.url,
+        originalFilename: validated.filename,
+        mimeType: validated.mime,
+        sizeBytes: buffer.length,
+        expiresAt
+      });
+      request.log.info({
+        event: "oci_upload_completed",
+        route: context.route,
+        publicKey: form.publicKey,
+        uploadId: upload.id,
+        mimetype: validated.mime,
+        size: buffer.length
+      }, "OCI upload completed");
+      return uploadResponse({ id: upload.id, url: upload.url, filename: validated.filename, mimetype: validated.mime, size: buffer.length, expiresAt });
+    } catch (error) {
+      void deleteFile(stored.objectKey).catch(() => undefined);
+      request.log.error({ event: "upload_record_failed", route: context.route, publicKey: form.publicKey, reason: error instanceof Error ? error.message : "unknown" }, "Failed to persist upload record");
+      return problem(reply, 500, "Upload failed", "The uploaded file could not be recorded. Please try again shortly.", { code: "UPLOAD_RECORD_FAILED" });
     }
   }
 
@@ -1132,7 +1220,33 @@ export function buildApp(config: AppConfig, store: Store, dependencies: AppDepen
     if (!sameOrigin(request) && actor.id !== "service-key") return problem(reply, 403, "Forbidden", "Invalid origin.");
     const form = await store.getForm(request.params.publicKey);
     if (!form || (actor.role === "tenant" && actor.tenantId !== form.tenantId)) return problem(reply, 404, "Not found", "Form not found.");
-    return processMediaUpload(request, reply, { route: "admin", publicKey: form.publicKey });
+    return processMediaUpload(request, reply, { route: "admin", form });
+  });
+
+  app.get<{ Params: { uploadId: string } }>("/v1/admin/uploads/:uploadId/content", async (request, reply) => {
+    const actor = await adminFor(request);
+    if (!actor) return problem(reply, 401, "Unauthorized", "Sign in required.");
+    if (!z.string().uuid().safeParse(request.params.uploadId).success) return problem(reply, 404, "Not found", "Upload not found.");
+    const upload = await store.getUpload(request.params.uploadId);
+    if (!upload || (actor.role === "tenant" && actor.tenantId !== upload.tenantId)) return problem(reply, 404, "Not found", "Upload not found.");
+    try {
+      const file = await downloadFile(upload.objectKey);
+      reply.header("Content-Type", file.contentType || upload.mimeType);
+      reply.header("Content-Disposition", `inline; filename="${upload.originalFilename.replace(/["\\\\]/g, "_")}"`);
+      reply.header("Cache-Control", "private, max-age=300");
+      reply.header("X-Content-Type-Options", "nosniff");
+      return reply.send(file.body);
+    } catch {
+      return problem(reply, 502, "Unavailable", "The file could not be retrieved from object storage.");
+    }
+  });
+
+  app.get<{ Params: { uploadId: string } }>("/v1/admin/uploads/:uploadId", async (request, reply) => {
+    const actor = await adminFor(request);
+    if (!actor) return problem(reply, 401, "Unauthorized", "Sign in required.");
+    const upload = await store.getUpload(request.params.uploadId);
+    if (!upload || (actor.role === "tenant" && actor.tenantId !== upload.tenantId)) return problem(reply, 404, "Not found", "Upload not found.");
+    return uploadResponse({ id: upload.id, url: upload.url, filename: upload.originalFilename, mimetype: upload.mimeType, size: upload.sizeBytes, expiresAt: new Date(upload.expiresAt) });
   });
 
   app.get<{ Params: { publicKey: string; submissionId: string } }>("/v1/admin/forms/:publicKey/delivery/:submissionId", async (request, reply) => {
@@ -1184,7 +1298,7 @@ export function buildApp(config: AppConfig, store: Store, dependencies: AppDepen
   app.post<{ Params: { publicKey: string } }>("/v1/forms/:publicKey/submissions", async (request, reply) => {
     const form = await store.getActiveForm(request.params.publicKey);
     if (!form) return problem(reply, 404, "Not found", "Form not found or disabled.");
-    if (!isAllowedOrigin(request.headers.origin, form.allowedOrigins)) {
+    if (!allowsOrigin(request.headers.origin, form.allowedOrigins)) {
       return problem(reply, 403, "Forbidden", "Origin is not allowed for this form.");
     }
     const usage = await store.getTenantLimits(form.tenantId);
@@ -1225,18 +1339,33 @@ export function buildApp(config: AppConfig, store: Store, dependencies: AppDepen
       });
     }
 
+    let media: ReturnType<typeof extractMediaAttachments>;
+    try {
+      media = extractMediaAttachments(form, payload);
+    } catch (error) {
+      if (error instanceof MediaReferenceError) return problem(reply, 422, "Invalid upload", error.message, { code: "INVALID_UPLOAD_REFERENCE" });
+      throw error;
+    }
+
     const expiresAt = new Date(Date.now() + config.RETENTION_DAYS * 24 * 60 * 60 * 1000);
     const accessToken = newSubmissionAccessToken();
-    const result = await store.createSubmission({
-      form,
-      payload,
-      status: spam ? "spam" : "accepted",
-      sourceOrigin: request.headers.origin,
-      sourceIpHash: ipHash,
-      idempotencyKey,
-      accessTokenHash: hashSubmissionAccessToken(accessToken),
-      expiresAt
-    });
+    let result: Awaited<ReturnType<Store["createSubmission"]>>;
+    try {
+      result = await store.createSubmission({
+        form,
+        payload,
+        media,
+        status: spam ? "spam" : "accepted",
+        sourceOrigin: request.headers.origin,
+        sourceIpHash: ipHash,
+        idempotencyKey,
+        accessTokenHash: hashSubmissionAccessToken(accessToken),
+        expiresAt
+      });
+    } catch (error) {
+      if (error instanceof MediaReferenceError) return problem(reply, 422, "Invalid upload", error.message, { code: "INVALID_UPLOAD_REFERENCE" });
+      throw error;
+    }
     const response = {
       status: result.submission.status,
       message: form.successMessage,
@@ -1253,11 +1382,11 @@ export function buildApp(config: AppConfig, store: Store, dependencies: AppDepen
   app.post<{ Params: { publicKey: string } }>("/v1/forms/:publicKey/upload", { bodyLimit: uploadBodyLimit }, async (request, reply) => {
     const form = await store.getActiveForm(request.params.publicKey);
     if (!form) return problem(reply, 404, "Not found", "Form not found or disabled.");
-    if (!isAllowedOrigin(request.headers.origin, form.allowedOrigins)) {
+    if (!allowsOrigin(request.headers.origin, form.allowedOrigins)) {
       return problem(reply, 403, "Forbidden", "Origin is not allowed for this form.");
     }
     applyCors(reply, request.headers.origin);
-    return processMediaUpload(request, reply, { route: "public", publicKey: form.publicKey });
+    return processMediaUpload(request, reply, { route: "public", form });
   });
 
 

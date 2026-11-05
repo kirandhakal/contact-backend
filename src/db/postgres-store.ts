@@ -27,8 +27,12 @@ import type {
   AuthChallenge,
   AuthChallengeResult,
   RotateAuthChallengeResult,
-  VerifyAuthChallengeResult
+  VerifyAuthChallengeResult,
+  CreateUploadInput,
+  MediaAttachmentInput,
+  UploadRecord
 } from "../types.js";
+import { MediaReferenceError, normalizeUploadConfig } from "../media.js";
 
 const { Pool } = pg;
 
@@ -43,7 +47,26 @@ function mapForm(row: pg.QueryResultRow): FormRecord {
     successMessage: row.success_message,
     honeypotField: row.honeypot_field,
     version: Number(row.version),
-    schema: row.schema
+    schema: row.schema,
+    uploadConfig: normalizeUploadConfig(row.upload_config)
+  };
+}
+
+function mapUpload(row: pg.QueryResultRow): UploadRecord {
+  return {
+    id: row.id,
+    tenantId: row.tenant_id,
+    formId: row.form_id,
+    objectKey: row.object_key,
+    url: row.url,
+    originalFilename: row.original_filename,
+    mimeType: row.mime_type,
+    sizeBytes: Number(row.size_bytes),
+    status: row.status,
+    submissionId: row.submission_id ?? undefined,
+    fieldKey: row.field_key ?? undefined,
+    createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : String(row.created_at),
+    expiresAt: row.expires_at instanceof Date ? row.expires_at.toISOString() : String(row.expires_at)
   };
 }
 
@@ -576,8 +599,8 @@ export class PostgresStore implements Store {
         : await client.query("insert into tenants(name) values($1) returning id", [tenantSlug(input.tenantName)]);
       if (!tenant.rowCount) throw new Error("Tenant not found");
       const form = await client.query(
-        `insert into forms(tenant_id, public_key, name, allowed_origins, success_message, honeypot_field)
-         values($1, $2, $3, $4, $5, $6)
+        `insert into forms(tenant_id, public_key, name, allowed_origins, success_message, honeypot_field, upload_config)
+         values($1, $2, $3, $4, $5, $6, $7)
          returning *`,
         [
           tenant.rows[0].id,
@@ -585,7 +608,8 @@ export class PostgresStore implements Store {
           name,
           input.allowedOrigins,
           input.successMessage ?? "Thank you. We received your message.",
-          input.honeypotField ?? "_website"
+          input.honeypotField ?? "_website",
+          normalizeUploadConfig(input.uploadConfig)
         ]
       );
       await client.query("insert into form_versions(form_id, version, schema) values($1, 1, $2)", [
@@ -638,7 +662,7 @@ export class PostgresStore implements Store {
     return result.rows.map(row => mapDestination(row, this.encryptionKey));
   }
 
-  async updateForm(publicKey: string, input: Partial<Pick<CreateFormInput, "name" | "allowedOrigins" | "successMessage" | "schema" | "destinations">> & { status?: "active" | "disabled" }): Promise<FormRecord | null> {
+  async updateForm(publicKey: string, input: Partial<Pick<CreateFormInput, "name" | "allowedOrigins" | "successMessage" | "schema" | "destinations" | "uploadConfig">> & { status?: "active" | "disabled" }): Promise<FormRecord | null> {
     const name = input.name === undefined ? null : formSlug(input.name);
     if (input.name !== undefined && (!name || name.length > 200)) throw Object.assign(new Error("Invalid form name"), { code: "22P02" });
     const client = await this.pool.connect();
@@ -647,9 +671,10 @@ export class PostgresStore implements Store {
       const updated = await client.query(
         `update forms set
           name = coalesce($2, name), allowed_origins = coalesce($3, allowed_origins),
-          success_message = coalesce($4, success_message), status = coalesce($5, status)
+          success_message = coalesce($4, success_message), status = coalesce($5, status),
+          upload_config = case when $6::jsonb is null then upload_config else $6::jsonb end
          where public_key = $1 returning *`,
-        [publicKey, name, input.allowedOrigins ?? null, input.successMessage ?? null, input.status ?? null]
+        [publicKey, name, input.allowedOrigins ?? null, input.successMessage ?? null, input.status ?? null, input.uploadConfig === undefined ? null : JSON.stringify(normalizeUploadConfig(input.uploadConfig))]
       );
       if (!updated.rowCount) { await client.query("rollback"); return null; }
       if (input.destinations !== undefined) {
@@ -689,6 +714,7 @@ export class PostgresStore implements Store {
     idempotencyKey?: string;
     accessTokenHash: string;
     expiresAt: Date;
+    media?: MediaAttachmentInput[];
   }): Promise<SubmissionResult> {
     const client = await this.pool.connect();
     try {
@@ -703,6 +729,26 @@ export class PostgresStore implements Store {
           await client.query("commit");
           return { submission: mapSubmission(existing.rows[0]), duplicate: true };
         }
+      }
+
+      // Upload references are resolved inside the same transaction as the
+      // submission so a row can never be attached to two submissions.
+      const resolvedUploads = new Map<string, string>();
+      if (args.media?.length) {
+        const references = [...new Set(args.media.map((item) => item.uploadId))];
+        const uploads = await client.query(
+          `select id, url from uploads
+           where form_id = $1 and tenant_id = $2 and status = 'pending' and expires_at > now()
+             and (id::text = any($3::text[]) or url = any($3::text[]))
+           for update`,
+          [args.form.id, args.form.tenantId, references]
+        );
+        for (const row of uploads.rows) {
+          resolvedUploads.set(String(row.id), String(row.id));
+          resolvedUploads.set(String(row.url), String(row.id));
+        }
+        const missing = references.filter((reference) => !resolvedUploads.has(reference));
+        if (missing.length) throw new MediaReferenceError("One or more uploads are invalid, expired, or belong to another form.");
       }
 
       const inserted = await client.query(
@@ -722,6 +768,18 @@ export class PostgresStore implements Store {
           args.expiresAt
         ]
       );
+      if (args.media?.length) {
+        for (const item of args.media) {
+          const uploadId = resolvedUploads.get(item.uploadId);
+          if (!uploadId) throw new MediaReferenceError("One or more uploads are invalid, expired, or belong to another form.");
+          const attached = await client.query(
+            `update uploads set status = 'attached', submission_id = $1, field_key = $2
+             where id = $3 and form_id = $4 and tenant_id = $5 and status = 'pending'`,
+            [inserted.rows[0].id, item.fieldKey, uploadId, args.form.id, args.form.tenantId]
+          );
+          if (!attached.rowCount) throw new MediaReferenceError("One or more uploads could not be attached.");
+        }
+      }
       if (args.status === "accepted" && !args.skipAutomatic) {
         const destinations = await client.query("SELECT * FROM destinations WHERE form_id=$1 AND active=true", [args.form.id]);
         for (const row of destinations.rows) {
@@ -810,7 +868,8 @@ export class PostgresStore implements Store {
       if (query.to) where.push(`s.created_at <= ${bind(query.to)}::timestamptz`);
       where.push(...payloadConditions(query.fields, bind));
       source = `select s.id, s.created_at, f.name, 0 as usage,
-        jsonb_build_object('id',s.id,'payload',s.payload,'status',s.status,'createdAt',s.created_at,'sourceOrigin',s.source_origin,'formName',f.name,'formPublicKey',f.public_key,'tenantName',t.name) as item
+        jsonb_build_object('id',s.id,'payload',s.payload,'status',s.status,'createdAt',s.created_at,'sourceOrigin',s.source_origin,'formName',f.name,'formPublicKey',f.public_key,'tenantName',t.name,
+          'attachments',coalesce((select jsonb_agg(jsonb_build_object('id',u.id,'filename',u.original_filename,'mimeType',u.mime_type,'size',u.size_bytes,'fieldKey',u.field_key,'status',u.status,'url',u.url,'contentUrl','/v1/admin/uploads/' || u.id || '/content') order by u.created_at) from uploads u where u.submission_id=s.id and u.status='attached'),'[]'::jsonb)) as item
         from submissions s join forms f on f.id=s.form_id join tenants t on t.id=s.tenant_id where ${where.join(" and ")}`;
     } else if (resource === "forms") {
       if (query.tenantId) where.push(`f.tenant_id = ${bind(query.tenantId)}`);
@@ -1154,6 +1213,55 @@ export class PostgresStore implements Store {
        where id = $1`,
       [id, dead ? "dead" : "failed", attempts, delaySeconds, error.slice(0, 1000)]
     );
+  }
+
+  async createUpload(input: CreateUploadInput): Promise<UploadRecord> {
+    const result = await this.pool.query(
+      `insert into uploads(tenant_id, form_id, object_key, url, original_filename, mime_type, size_bytes, expires_at)
+       values($1, $2, $3, $4, $5, $6, $7, $8)
+       returning *`,
+      [input.tenantId, input.formId, input.objectKey, input.url, input.originalFilename, input.mimeType, input.sizeBytes, input.expiresAt]
+    );
+    return mapUpload(result.rows[0]);
+  }
+
+  async getUpload(uploadId: string): Promise<UploadRecord | null> {
+    const result = await this.pool.query("select * from uploads where id = $1 and status <> 'deleted'", [uploadId]);
+    return result.rowCount ? mapUpload(result.rows[0]) : null;
+  }
+
+  async getUploadForForm(uploadId: string, formId: string): Promise<UploadRecord | null> {
+    const result = await this.pool.query(
+      "select * from uploads where id = $1 and form_id = $2 and status <> 'deleted'",
+      [uploadId, formId]
+    );
+    return result.rowCount ? mapUpload(result.rows[0]) : null;
+  }
+
+  async listUploadsForSubmission(submissionId: string): Promise<UploadRecord[]> {
+    const result = await this.pool.query(
+      "select * from uploads where submission_id = $1 and status = 'attached' order by created_at",
+      [submissionId]
+    );
+    return result.rows.map(mapUpload);
+  }
+
+  async getTenantStorageBytes(tenantId: string): Promise<number> {
+    const result = await this.pool.query(
+      "select coalesce(sum(size_bytes), 0)::bigint as total from uploads where tenant_id = $1 and status <> 'deleted'",
+      [tenantId]
+    );
+    return Number(result.rows[0]?.total ?? 0);
+  }
+
+  async deleteExpiredUploads(now: Date): Promise<UploadRecord[]> {
+    const result = await this.pool.query(
+      `update uploads set status = 'deleted'
+       where status = 'pending' and expires_at <= $1
+       returning *`,
+      [now]
+    );
+    return result.rows.map(mapUpload);
   }
 
   async deleteExpiredSubmissions(now: Date): Promise<number> {

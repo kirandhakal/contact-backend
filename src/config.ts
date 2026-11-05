@@ -35,6 +35,10 @@ const EnvSchema = z.object({
   /** Multipart file upload limit in megabytes (applied to the file itself). */
   MAX_FILE_SIZE_MB: z.coerce.number().int().positive().max(100).default(10),
   MAX_FILES_PER_REQUEST: z.coerce.number().int().positive().max(20).default(1),
+  /** How long an uploaded file may wait for a submission before it is purged. */
+  UPLOAD_PENDING_TTL_SECONDS: z.coerce.number().int().positive().default(3600),
+  /** Per-tenant storage cap across pending and attached uploads, in megabytes. */
+  MAX_TENANT_STORAGE_MB: z.coerce.number().int().positive().default(1024),
   RATE_LIMIT_WINDOW_SECONDS: z.coerce.number().int().positive().default(60),
   RATE_LIMIT_MAX: z.coerce.number().int().positive().default(20),
   RETENTION_DAYS: z.coerce.number().int().positive().default(90),

@@ -5,6 +5,50 @@ export type DestinationKind = "email" | "webhook" | "sms" | "discord" | "slack" 
 export type SubmissionStatus = "accepted" | "spam" | "deleted";
 export type AdminRole = "sudo" | "super" | "tenant";
 
+export type UploadType = "single" | "multiple";
+
+export interface UploadConfig {
+  enabled?: boolean;
+  maxSizeMB?: number;
+  allowedTypes?: string;
+  uploadType?: UploadType;
+  maxFiles?: number;
+}
+
+export type UploadStatus = "pending" | "attached" | "deleted";
+
+export interface UploadRecord {
+  id: string;
+  tenantId: string;
+  formId: string;
+  objectKey: string;
+  url: string;
+  originalFilename: string;
+  mimeType: string;
+  sizeBytes: number;
+  status: UploadStatus;
+  submissionId?: string;
+  fieldKey?: string;
+  createdAt: string;
+  expiresAt: string;
+}
+
+export interface CreateUploadInput {
+  tenantId: string;
+  formId: string;
+  objectKey: string;
+  url: string;
+  originalFilename: string;
+  mimeType: string;
+  sizeBytes: number;
+  expiresAt: Date;
+}
+
+export interface MediaAttachmentInput {
+  uploadId: string;
+  fieldKey: string;
+}
+
 export interface TenantLimits {
   maxOriginsPerForm: number;
   maxForms: number;
@@ -48,6 +92,7 @@ export interface CreateFormInput {
   successMessage?: string;
   honeypotField?: string;
   schema: JSONSchemaType<unknown> | JsonObject;
+  uploadConfig?: UploadConfig;
   destinations?: DestinationInput[];
 }
 
@@ -62,6 +107,7 @@ export interface FormRecord {
   honeypotField: string;
   version: number;
   schema: JsonObject;
+  uploadConfig: UploadConfig;
 }
 
 export interface DestinationRecord {
@@ -249,7 +295,14 @@ export interface Store {
     idempotencyKey?: string;
     accessTokenHash: string;
     expiresAt: Date;
+    media?: MediaAttachmentInput[];
   }): Promise<SubmissionResult>;
+  createUpload(input: CreateUploadInput): Promise<UploadRecord>;
+  getUpload(uploadId: string): Promise<UploadRecord | null>;
+  getUploadForForm(uploadId: string, formId: string): Promise<UploadRecord | null>;
+  listUploadsForSubmission(submissionId: string): Promise<UploadRecord[]>;
+  getTenantStorageBytes(tenantId: string): Promise<number>;
+  deleteExpiredUploads(now: Date): Promise<UploadRecord[]>;
   getSubmissionByAccessToken(submissionId: string, accessTokenHash: string): Promise<{
     submission: SubmissionRecord;
     allowedOrigins: string[];
@@ -265,7 +318,7 @@ export interface Store {
   getTenantLimits(tenantId: string): Promise<TenantUsage | null>;
   updateTenantLimits(tenantId: string, limits: TenantLimits): Promise<boolean>;
   getForm(publicKey: string): Promise<FormRecord | null>;
-  updateForm(publicKey: string, input: Partial<Pick<CreateFormInput, "name" | "allowedOrigins" | "successMessage" | "schema" | "destinations">> & { status?: "active" | "disabled" }): Promise<FormRecord | null>;
+  updateForm(publicKey: string, input: Partial<Pick<CreateFormInput, "name" | "allowedOrigins" | "successMessage" | "schema" | "destinations" | "uploadConfig">> & { status?: "active" | "disabled" }): Promise<FormRecord | null>;
   deleteForm(publicKey: string): Promise<boolean>;
   deleteSubmission(submissionId: string): Promise<boolean>;
   updateSubmission(submissionId: string, payload: JsonObject, status: SubmissionStatus): Promise<boolean>;

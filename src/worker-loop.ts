@@ -1,11 +1,13 @@
 import type { AppConfig } from "./config.js";
 import { deliverJob } from "./delivery.js";
+import { deleteFile } from "./storage.js";
 import type { OutboxJob, Store } from "./types.js";
 
-type WorkerStore = Pick<Store, "deleteExpiredSubmissions" | "deleteExpiredAuthData" | "claimJobs" | "markJobDelivered" | "markJobFailed" | "claimSiteContactJobs" | "markSiteContactJobDelivered" | "markSiteContactJobFailed">;
+type WorkerStore = Pick<Store, "deleteExpiredSubmissions" | "deleteExpiredAuthData" | "deleteExpiredUploads" | "claimJobs" | "markJobDelivered" | "markJobFailed" | "claimSiteContactJobs" | "markSiteContactJobDelivered" | "markSiteContactJobFailed">;
 
 export function createWorkerTick(store: WorkerStore, config: AppConfig, now = () => Date.now()) {
   let lastCleanup = 0;
+  let lastUploadCleanup = 0;
 
   async function deliver(jobs: OutboxJob[], markDelivered: (id: string) => Promise<void>, markFailed: (id: string, attempts: number, error: string) => Promise<void>) {
     for (const job of jobs) {
@@ -26,6 +28,12 @@ export function createWorkerTick(store: WorkerStore, config: AppConfig, now = ()
       await store.deleteExpiredSubmissions(new Date(timestamp));
       await store.deleteExpiredAuthData(new Date(timestamp));
       lastCleanup = timestamp;
+    }
+
+    if (timestamp - lastUploadCleanup > 10 * 60 * 1000) {
+      const expired = await store.deleteExpiredUploads(new Date(timestamp));
+      await Promise.all(expired.map(upload => deleteFile(upload.objectKey).catch(() => undefined)));
+      lastUploadCleanup = timestamp;
     }
 
     await deliver(await store.claimJobs(10), store.markJobDelivered.bind(store), store.markJobFailed.bind(store));
