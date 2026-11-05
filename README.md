@@ -11,6 +11,7 @@ cp .env.example .env
 docker compose up -d postgres
 npm install
 npm run migrate
+npm run migrate:status
 npm run dev
 ```
 
@@ -30,6 +31,20 @@ npm audit --omit=dev
 ```
 
 See [UNIVERSAL_CONTACT_FORM_BACKEND.md](./UNIVERSAL_CONTACT_FORM_BACKEND.md) for the full API contract and operational notes.
+
+### Migration history
+
+Applied migrations are recorded in the `schema_migrations` table with their
+checksum, timestamp, and duration. The runner skips files that already ran and
+refuses to continue if an applied file was edited afterwards. Show the status
+table with:
+
+```bash
+npm run migrate:status
+```
+
+`pending` means the file has not run yet; `changed` means its checksum no longer
+matches the recorded run and needs a new migration instead.
 
 ### Deployment smoke test
 

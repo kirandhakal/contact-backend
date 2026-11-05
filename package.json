@@ -19,7 +19,8 @@
     "smoke:signup": "node scripts/smoke-signup.mjs",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "build": "tsc -p tsconfig.build.json"
+    "build": "tsc -p tsconfig.build.json",
+    "migrate:status": "tsx src/db/migrate.ts --status"
   },
   "dependencies": {
     "@fastify/cors": "^10.0.1",
