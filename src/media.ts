@@ -85,7 +85,7 @@ export function formHasMediaFields(form: Pick<FormRecord, "schema" | "uploadConf
   return mediaFieldsFromSchema(form.schema, form.uploadConfig).length > 0;
 }
 
-export function mediaUploadPolicy(form: FormRecord, fallbackMaxFileSizeBytes: number, field?: MediaFieldConfig): MediaUploadPolicy {
+export function mediaUploadPolicy(form: Pick<FormRecord, "schema" | "uploadConfig">, fallbackMaxFileSizeBytes: number, field?: MediaFieldConfig): MediaUploadPolicy {
   const config = normalizeUploadConfig(form.uploadConfig);
   const legacy = mediaFieldsFromSchema(form.schema, config);
   const enabled = config.enabled === true || legacy.length > 0;

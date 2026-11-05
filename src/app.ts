@@ -865,10 +865,10 @@ export function buildApp(config: AppConfig, store: Store, dependencies: AppDepen
     if (admin.id !== "service-key" && !sameOrigin(request)) return problem(reply, 403, "Forbidden", "Invalid origin.");
     const body = assertPlainObject(request.body) && Array.isArray(request.body.allowedOrigins)
       ? {
-          ...request.body,
-          allowedOrigins: request.body.allowedOrigins.map((origin) =>
-            typeof origin === "string" ? normalizeExactOrigin(origin) ?? origin : origin)
-        }
+        ...request.body,
+        allowedOrigins: request.body.allowedOrigins.map((origin) =>
+          typeof origin === "string" ? normalizeExactOrigin(origin) ?? origin : origin)
+      }
       : request.body;
     if (!validateCreateForm(body)) {
       return problem(reply, 422, "Validation failed", "Form definition is invalid.", {
@@ -883,6 +883,7 @@ export function buildApp(config: AppConfig, store: Store, dependencies: AppDepen
     input.tenantName = tenantSlug(input.tenantName);
     input.name = formSlug(input.name);
     input.uploadConfig = normalizeUploadConfig(input.uploadConfig);
+    if (input.uploadConfig.maxSizeMB !== undefined) input.uploadConfig.maxSizeMB = Math.min(input.uploadConfig.maxSizeMB, config.MAX_FILE_SIZE_MB);
     if (!input.tenantId && (!input.tenantName || input.tenantName.length > 200)) return problem(reply, 422, "Invalid tenant name", "Use a workspace name that produces a non-empty slug of at most 200 characters.");
     if (!input.name || input.name.length > 200) return problem(reply, 422, "Invalid form name", "Use a form name that produces a non-empty slug of at most 200 characters.");
     for (const origin of input.allowedOrigins) {
@@ -972,7 +973,7 @@ export function buildApp(config: AppConfig, store: Store, dependencies: AppDepen
       return problem(reply, 404, "Not found", "Form not found.");
     }
     if (!assertPlainObject(request.body)) return problem(reply, 400, "Invalid request", "Form changes are required.");
-    const changes: Partial<Pick<CreateFormInput, "name" | "allowedOrigins" | "successMessage" | "schema" | "destinations">> & { status?: "active" | "disabled" } = {};
+    const changes: Partial<Pick<CreateFormInput, "name" | "allowedOrigins" | "successMessage" | "schema" | "destinations" | "uploadConfig">> & { status?: "active" | "disabled" } = {};
     if (request.body.status !== undefined) {
       if (!["active", "disabled"].includes(String(request.body.status))) return problem(reply, 422, "Invalid request", "Status must be active or disabled.");
       changes.status = request.body.status as "active" | "disabled";
@@ -1057,8 +1058,10 @@ export function buildApp(config: AppConfig, store: Store, dependencies: AppDepen
       if (error instanceof MediaReferenceError) return problem(reply, 422, "Invalid upload", error.message, { code: "INVALID_UPLOAD_REFERENCE" });
       throw error;
     }
-    const result = await store.createSubmission({ form, payload, media, skipAutomatic: parsed.data.destinationIds !== undefined, status: "accepted", sourceOrigin: "admin-test", sourceIpHash: hashIp(request.ip, config.DATA_ENCRYPTION_KEY),
-      idempotencyKey: `test-${parsed.data.requestId}`, accessTokenHash: hashSubmissionAccessToken(newSubmissionAccessToken()), expiresAt: new Date(Date.now() + config.RETENTION_DAYS * 86400000) });
+    const result = await store.createSubmission({
+      form, payload, media, skipAutomatic: parsed.data.destinationIds !== undefined, status: "accepted", sourceOrigin: "admin-test", sourceIpHash: hashIp(request.ip, config.DATA_ENCRYPTION_KEY),
+      idempotencyKey: `test-${parsed.data.requestId}`, accessTokenHash: hashSubmissionAccessToken(newSubmissionAccessToken()), expiresAt: new Date(Date.now() + config.RETENTION_DAYS * 86400000)
+    });
     const ids = parsed.data.destinationIds;
     const queued = ids?.length ? await store.queueReplies(form.publicKey, [result.submission.id], [...new Set(ids)], "", parsed.data.requestId) : 0;
     return reply.code(202).send({ message: ids ? `Test submission saved with the same field data. ${queued} selected integration messages queued.` : "Test submission saved. Automatic messages are queued; check delivery status below.", submissionId: result.submission.id });
@@ -1070,7 +1073,7 @@ export function buildApp(config: AppConfig, store: Store, dependencies: AppDepen
     context: { route: "admin" | "public"; form: { id: string; tenantId: string; publicKey: string; schema: JsonObject; uploadConfig: import("./types.js").UploadConfig } }
   ) {
     const { form } = context;
-    const policy = mediaUploadPolicy(form as never, maxFileSizeBytes);
+    const policy = mediaUploadPolicy(form, maxFileSizeBytes);
     request.log.info({
       event: "upload_received",
       route: context.route,
@@ -1079,7 +1082,7 @@ export function buildApp(config: AppConfig, store: Store, dependencies: AppDepen
       maxFileSizeBytes: policy.maxSizeBytes
     }, "Upload request received");
 
-    if (!formHasMediaFields(form as never) || !policy.enabled) {
+    if (!formHasMediaFields(form) || !policy.enabled) {
       return problem(reply, 403, "Uploads disabled", "This form does not allow file uploads.");
     }
 
@@ -1154,7 +1157,7 @@ export function buildApp(config: AppConfig, store: Store, dependencies: AppDepen
     }
 
     const storageBytes = await store.getTenantStorageBytes(form.tenantId);
-    const quotaBytes = config.MAX_TENANT_STORAGE_MB * 1024 * 1024;
+    const quotaBytes = (config.MAX_TENANT_STORAGE_MB ?? 1024) * 1024 * 1024;
     if (storageBytes + buffer.length > quotaBytes) {
       return problem(reply, 413, "Storage quota reached", "This workspace has reached its media storage allowance.", { code: "STORAGE_QUOTA_EXCEEDED" });
     }

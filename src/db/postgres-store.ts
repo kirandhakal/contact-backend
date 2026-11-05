@@ -879,7 +879,7 @@ export class PostgresStore implements Store {
       if (query.from) dates.push(`s.created_at >= ${bind(query.from)}::timestamptz`);
       if (query.to) dates.push(`s.created_at <= ${bind(query.to)}::timestamptz`);
       source = `select f.id, f.created_at, f.name, stats.total as usage,
-        jsonb_build_object('publicKey',f.public_key,'tenantId',f.tenant_id,'tenantName',t.name,'name',f.name,'status',f.status,'allowedOrigins',f.allowed_origins,'submissionCount',stats.total,'acceptedCount',stats.accepted,'spamCount',stats.spam,'lastSubmittedAt',stats.last_at,'schema',v.schema,'successMessage',f.success_message,'honeypotField',f.honeypot_field) as item
+        jsonb_build_object('publicKey',f.public_key,'tenantId',f.tenant_id,'tenantName',t.name,'name',f.name,'status',f.status,'allowedOrigins',f.allowed_origins,'submissionCount',stats.total,'acceptedCount',stats.accepted,'spamCount',stats.spam,'lastSubmittedAt',stats.last_at,'schema',v.schema,'successMessage',f.success_message,'honeypotField',f.honeypot_field,'uploadConfig',coalesce(f.upload_config,'{}'::jsonb)) as item
         from forms f join tenants t on t.id=f.tenant_id
         join lateral (select schema from form_versions where form_id=f.id order by version desc limit 1) v on true
         cross join lateral (select count(*)::int total, count(*) filter(where s.status='accepted')::int accepted, count(*) filter(where s.status='spam')::int spam, max(s.created_at) last_at from submissions s where ${dates.join(" and ")}) stats

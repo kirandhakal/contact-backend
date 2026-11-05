@@ -3,9 +3,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AppConfig } from "../src/config.js";
 import type { CreateFormInput, FormRecord, Store } from "../src/types.js";
 
-const uploadFile = vi.hoisted(() => vi.fn(async () => "https://objectstorage.example/n/ns/b/bucket/o/file.png"));
+const uploadFile = vi.hoisted(() => vi.fn(async () => ({ objectKey: "uploads/tenant/form/file.png", url: "https://objectstorage.example/n/ns/b/bucket/o/file.png" })));
+const deleteFile = vi.hoisted(() => vi.fn(async () => undefined));
+const downloadFile = vi.hoisted(() => vi.fn(async () => ({ body: Buffer.from("png"), contentType: "image/png" })));
 
-vi.mock("../src/storage.js", () => ({ uploadFile }));
+vi.mock("../src/storage.js", () => ({
+  uploadFile,
+  deleteFile,
+  downloadFile,
+  buildObjectKey: (tenantId: string, formId: string, filename: string) => `uploads/${tenantId}/${formId}/${filename}`
+}));
 
 import { buildApp } from "../src/app.js";
 
@@ -25,6 +32,8 @@ const config = {
   MAX_BODY_BYTES: 4096,
   MAX_FILE_SIZE_MB: 1,
   MAX_FILES_PER_REQUEST: 1,
+  UPLOAD_PENDING_TTL_SECONDS: 3600,
+  MAX_TENANT_STORAGE_MB: 1024,
   RATE_LIMIT_WINDOW_SECONDS: 60,
   RATE_LIMIT_MAX: 20,
   RETENTION_DAYS: 90,
@@ -77,12 +86,28 @@ class MemoryStore implements Partial<Store> {
       allowedOrigins: input.allowedOrigins,
       honeypotField: input.honeypotField ?? "_website",
       successMessage: input.successMessage ?? "Thanks",
-      version: 1
+      version: 1,
+      uploadConfig: input.uploadConfig ?? {}
     };
     this.forms.set(publicKey, form);
     return form;
   }
   async getTenantLimits() { return null; }
+  uploads = new Map<string, import("../src/types.js").UploadRecord>();
+  async createUpload(input: import("../src/types.js").CreateUploadInput) {
+    const upload: import("../src/types.js").UploadRecord = {
+      id: randomUUID(), tenantId: input.tenantId, formId: input.formId, objectKey: input.objectKey, url: input.url,
+      originalFilename: input.originalFilename, mimeType: input.mimeType, sizeBytes: input.sizeBytes,
+      status: "pending", submissionId: undefined, fieldKey: undefined, createdAt: new Date().toISOString(), expiresAt: input.expiresAt.toISOString()
+    };
+    this.uploads.set(upload.id, upload);
+    return upload;
+  }
+  async getUpload(uploadId: string) { return this.uploads.get(uploadId) ?? null; }
+  async getUploadForForm(uploadId: string, formId: string) { const upload = this.uploads.get(uploadId); return upload && upload.formId === formId ? upload : null; }
+  async listUploadsForSubmission(submissionId: string) { return [...this.uploads.values()].filter(u => u.submissionId === submissionId && u.status === "attached"); }
+  async getTenantStorageBytes(tenantId: string) { return [...this.uploads.values()].filter(u => u.tenantId === tenantId && u.status !== "deleted").reduce((sum, u) => sum + u.sizeBytes, 0); }
+  async deleteExpiredUploads(now: Date) { const expired = [...this.uploads.values()].filter(u => u.status === "pending" && new Date(u.expiresAt) <= now); for (const u of expired) u.status = "deleted"; return expired; }
 }
 
 function multipartPayload(filename: string, mimetype: string, content: Buffer) {
@@ -100,7 +125,8 @@ function multipartPayload(filename: string, mimetype: string, content: Buffer) {
 describe("media upload endpoints", () => {
   beforeEach(() => {
     uploadFile.mockReset();
-    uploadFile.mockResolvedValue("https://objectstorage.example/n/ns/b/bucket/o/file.png");
+    deleteFile.mockReset();
+    uploadFile.mockResolvedValue({ objectKey: "uploads/tenant/form/file.png", url: "https://objectstorage.example/n/ns/b/bucket/o/file.png" });
   });
 
   afterEach(() => {
@@ -118,11 +144,11 @@ describe("media upload endpoints", () => {
       successMessage: "ok"
     }, "upload-form-key");
     const app = buildApp({ ...config, ...overrides }, store);
-    return { app, form };
+    return { app, form, store };
   }
 
   it("accepts a small PNG larger than MAX_BODY_BYTES via the public upload route", async () => {
-    const { app, form } = await seededApp();
+    const { app, form, store } = await seededApp();
     // Magic-byte check only needs a valid PNG header; pad to exceed the JSON bodyLimit.
     const padded = Buffer.concat([PNG_1X1, Buffer.alloc(config.MAX_BODY_BYTES)]);
     expect(padded.length).toBeGreaterThan(config.MAX_BODY_BYTES);
@@ -135,11 +161,32 @@ describe("media upload endpoints", () => {
     });
     expect(response.statusCode).toBe(200);
     expect(response.json()).toMatchObject({
+      uploadId: expect.any(String),
       url: "https://objectstorage.example/n/ns/b/bucket/o/file.png",
+      contentUrl: expect.stringMatching(/^\/v1\/admin\/uploads\/.+\/content$/),
       filename: "photo.png",
       mimetype: "image/png"
     });
     expect(uploadFile).toHaveBeenCalledOnce();
+    const [record] = [...store.uploads.values()];
+    expect(record).toMatchObject({ formId: form.id, tenantId: form.tenantId, status: "pending", originalFilename: "photo.png", mimeType: "image/png" });
+    expect(record.expiresAt).toBeTruthy();
+    await app.close();
+  });
+
+  it("rejects uploads for forms without media fields", async () => {
+    const store = new MemoryStore() as unknown as Store & MemoryStore;
+    const form = await store.createForm({
+      tenantName: "Plain tenant",
+      name: "Plain form",
+      allowedOrigins: ["https://example.com"],
+      schema: { type: "object", properties: { message: { type: "string" } } }
+    }, "plain-form-key");
+    const app = buildApp(config, store);
+    const multipart = multipartPayload("photo.png", "image/png", PNG_1X1);
+    const response = await app.inject({ method: "POST", url: `/v1/forms/${form.publicKey}/upload`, headers: multipart.headers, payload: multipart.payload });
+    expect(response.statusCode).toBe(403);
+    expect(uploadFile).not.toHaveBeenCalled();
     await app.close();
   });
 

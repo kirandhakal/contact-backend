@@ -320,6 +320,7 @@ class MemoryStore implements Store {
     if (input.allowedOrigins) form.allowedOrigins = input.allowedOrigins;
     if (input.successMessage) form.successMessage = input.successMessage;
     if (input.schema) { form.schema = input.schema as JsonObject; form.version += 1; }
+    if (input.uploadConfig) form.uploadConfig = input.uploadConfig;
     if (input.status) form.status = input.status;
     if (input.destinations) this.destinations.set(publicKey, input.destinations.map(d => ({ ...d, id: randomUUID(), formId: form.id, active: true })));
     return form;
@@ -360,7 +361,8 @@ class MemoryStore implements Store {
       successMessage: input.successMessage ?? "Thank you. We received your message.",
       honeypotField: input.honeypotField ?? "_website",
       version: 1,
-      schema: input.schema as JsonObject
+      schema: input.schema as JsonObject,
+      uploadConfig: input.uploadConfig ?? {}
     };
     this.forms.set(publicKey, form);
     this.destinations.set(publicKey, (input.destinations ?? []).map(d => ({ ...d, id: randomUUID(), formId: form.id, active: true })));
@@ -402,6 +404,22 @@ class MemoryStore implements Store {
     this.accessTokens.set(submission.id, args.accessTokenHash);
     return { submission, duplicate: false };
   }
+
+  uploads = new Map<string, import("../src/types.js").UploadRecord>();
+  async createUpload(input: import("../src/types.js").CreateUploadInput) {
+    const upload: import("../src/types.js").UploadRecord = {
+      id: randomUUID(), tenantId: input.tenantId, formId: input.formId, objectKey: input.objectKey, url: input.url,
+      originalFilename: input.originalFilename, mimeType: input.mimeType, sizeBytes: input.sizeBytes,
+      status: "pending", submissionId: undefined, fieldKey: undefined, createdAt: new Date().toISOString(), expiresAt: input.expiresAt.toISOString()
+    };
+    this.uploads.set(upload.id, upload);
+    return upload;
+  }
+  async getUpload(uploadId: string) { const upload = this.uploads.get(uploadId); return upload && upload.status !== "deleted" ? upload : null; }
+  async getUploadForForm(uploadId: string, formId: string) { const upload = await this.getUpload(uploadId); return upload && upload.formId === formId ? upload : null; }
+  async listUploadsForSubmission(submissionId: string) { return [...this.uploads.values()].filter(u => u.submissionId === submissionId && u.status === "attached"); }
+  async getTenantStorageBytes(tenantId: string) { return [...this.uploads.values()].filter(u => u.tenantId === tenantId && u.status !== "deleted").reduce((sum, u) => sum + u.sizeBytes, 0); }
+  async deleteExpiredUploads(now: Date) { const expired = [...this.uploads.values()].filter(u => u.status === "pending" && new Date(u.expiresAt) <= now); for (const u of expired) u.status = "deleted"; return expired; }
 
   accessTokens = new Map<string, string>();
   async getSubmissionByAccessToken(submissionId: string, accessTokenHash: string) {

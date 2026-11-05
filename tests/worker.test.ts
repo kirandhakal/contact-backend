@@ -9,6 +9,7 @@ function store() {
   return {
     deleteExpiredSubmissions: vi.fn().mockResolvedValue(0),
     deleteExpiredAuthData: vi.fn().mockResolvedValue(0),
+    deleteExpiredUploads: vi.fn().mockResolvedValue([]),
     claimJobs: vi.fn().mockResolvedValue([]),
     markJobDelivered: vi.fn().mockResolvedValue(undefined),
     markJobFailed: vi.fn().mockResolvedValue(undefined),
