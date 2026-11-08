@@ -1,18 +1,34 @@
 {
-  "tenantName": "Gourav Studio",
-  "name": "Gourav Studio inquiry",
-  "allowedOrigins": ["http://localhost:3001"],
-  "successMessage": "Thanks — your inquiry has been received.",
+  "tenantName": "Gourab Site",
+  "name": "gourab-contact-form",
+  "allowedOrigins": ["https://admirationseeker.vercel.app", "http://localhost:3001", "http://127.0.0.1:3001"],
+  "successMessage": "Thanks, your message was sent.",
   "honeypotField": "_website",
   "schema": {
     "type": "object",
     "additionalProperties": false,
-    "required": ["name", "email", "vision"],
+    "required": ["name", "email"],
     "properties": {
-      "name": { "type": "string", "minLength": 2, "maxLength": 100 },
-      "email": { "type": "string", "format": "email", "maxLength": 254 },
-      "vision": { "type": "string", "minLength": 10, "maxLength": 3000 }
+      "name": { "type": "string", "title": "Name", "minLength": 2, "maxLength": 500 },
+      "email": { "type": "string", "title": "Email", "format": "email", "maxLength": 254 },
+      "topic": { "type": "string", "title": "Topic", "maxLength": 500 },
+      "message": { "type": "string", "title": "Message", "maxLength": 5000 },
+      "file_upload": {
+        "title": "File upload",
+        "description": "The file upload provided by the submitter.",
+        "oneOf": [
+          { "type": "string" },
+          { "type": "array", "items": { "type": "string" } }
+        ],
+        "x-contact-media": { "multiple": true, "maxFiles": 5 }
+      }
     }
+  },
+  "uploadConfig": {
+    "enabled": true,
+    "uploadType": "multiple",
+    "maxFiles": 5,
+    "maxSizeMB": 10
   },
   "destinations": []
 }
