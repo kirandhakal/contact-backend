@@ -1,0 +1,124 @@
+name: Deploy Contact API to VM2
+
+on:
+  # Automatically run after the VM1 CI/CD workflow succeeds.
+  workflow_run:
+    workflows: ["CI/CD"]
+    types:
+      - completed
+    branches:
+      - main
+
+  # Allow manual deployment using an already-built image.
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Docker image tag (commit SHA already built by CI/CD)"
+        required: true
+        type: string
+
+concurrency:
+  group: contact-vm2-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: kirandhakal/contact-backend
+  DEPLOY_PATH: /var/www/contact-backend
+  IMAGE_TAG: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || inputs.image_tag }}
+
+jobs:
+  deploy-vm2:
+    name: Deploy API to VM2
+    runs-on: ubuntu-latest
+
+    # Automatic deployment only after successful VM1 CI/CD.
+    # Manual deployment is also allowed.
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success')
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Upload VM2 Compose configuration
+        uses: appleboy/scp-action@v1.0.0
+        with:
+          host: ${{ secrets.VM2_HOST }}
+          username: ${{ secrets.VM2_SSH_USER }}
+          key: ${{ secrets.VM2_SSH_PRIVATE_KEY }}
+          source: docker-compose-vm2.yml
+          target: ${{ env.DEPLOY_PATH }}
+
+      - name: Deploy API to VM2
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          IMAGE: ${{ env.IMAGE }}
+          IMAGE_TAG: ${{ env.IMAGE_TAG }}
+          DEPLOY_PATH: ${{ env.DEPLOY_PATH }}
+
+        with:
+          host: ${{ secrets.VM2_HOST }}
+          username: ${{ secrets.VM2_SSH_USER }}
+          key: ${{ secrets.VM2_SSH_PRIVATE_KEY }}
+          command_timeout: 15m
+          envs: IMAGE,IMAGE_TAG,DEPLOY_PATH
+
+          script: |
+            set -euo pipefail
+
+            cd "$DEPLOY_PATH"
+
+            test -f .env.docker
+            test -f docker-compose-vm2.yml
+
+            chmod 600 .env.docker
+
+            dc() {
+              sudo -n env IMAGE="$IMAGE" IMAGE_TAG="$IMAGE_TAG" \
+                docker compose \
+                -f docker-compose-vm2.yml \
+                --env-file .env.docker "$@"
+            }
+
+            echo "Checking Docker..."
+            sudo -n docker info >/dev/null
+
+            echo "Validating Compose configuration..."
+            dc config --quiet
+
+            echo "Pulling image: ${IMAGE}:${IMAGE_TAG}"
+            dc pull app
+
+            echo "Starting VM2 API..."
+            dc up -d --no-build --force-recreate app
+
+            HEALTHY=0
+
+            for i in $(seq 1 20); do
+              if dc exec -T app node -e \
+                "require('http').get('http://127.0.0.1:3100/health/ready', r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"; then
+
+                HEALTHY=1
+                echo "VM2 API health check passed on attempt $i"
+                break
+              fi
+
+              echo "VM2 attempt $i/20 not healthy; waiting 3 seconds..."
+              sleep 3
+            done
+
+            if [ "$HEALTHY" -ne 1 ]; then
+              echo "VM2 deployment health check failed"
+              dc logs --tail=100 app
+              exit 1
+            fi
+
+            echo "VM2 deployment successful"
+            dc ps
