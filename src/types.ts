@@ -165,6 +165,15 @@ export interface OutboxJob {
   form: Pick<FormRecord, "id" | "name">;
   destination: DestinationRecord;
   attempts: number;
+  /** Present on freshly claimed jobs; required to acknowledge ownership safely. */
+  leaseId?: string;
+}
+
+export interface UploadDeletionJob {
+  uploadId: string;
+  objectKey: string;
+  attempts: number;
+  leaseId: string;
 }
 
 export interface SiteContactMessage {
@@ -245,9 +254,10 @@ export interface Store {
   deleteSiteContact(id: string): Promise<boolean>;
   getSiteContactDestinations(): Promise<DestinationRecord[]>;
   updateSiteContactDestinations(destinations: DestinationInput[]): Promise<void>;
-  claimSiteContactJobs(limit: number): Promise<OutboxJob[]>;
-  markSiteContactJobDelivered(id: string): Promise<void>;
-  markSiteContactJobFailed(id: string, attempts: number, error: string): Promise<void>;
+  claimSiteContactJobs(limit: number, workerId?: string, leaseSeconds?: number): Promise<OutboxJob[]>;
+  markSiteContactJobDelivered(id: string, leaseId: string): Promise<boolean>;
+  markSiteContactJobFailed(id: string, attempts: number, error: string, leaseId: string): Promise<boolean>;
+  renewSiteContactJobLease(id: string, leaseId: string, leaseSeconds: number): Promise<boolean>;
   siteContactDeliveryStatus(messageId: string): Promise<JsonObject[]>;
   findReplySubmissions(publicKey: string, filters: import("./management.js").ReplyFilters): Promise<string[]>;
   queueReplies(publicKey: string, submissionIds: string[], destinationIds: string[], message: string, requestId: string, subject?: string): Promise<number>;
@@ -302,7 +312,11 @@ export interface Store {
   getUploadForForm(uploadId: string, formId: string): Promise<UploadRecord | null>;
   listUploadsForSubmission(submissionId: string): Promise<UploadRecord[]>;
   getTenantStorageBytes(tenantId: string): Promise<number>;
-  deleteExpiredUploads(now: Date): Promise<UploadRecord[]>;
+  deleteExpiredUploads(now: Date, limit?: number): Promise<UploadRecord[]>;
+  enqueueUploadDeletion(objectKey: string): Promise<void>;
+  claimUploadDeletionJobs(limit: number, workerId?: string, leaseSeconds?: number): Promise<UploadDeletionJob[]>;
+  markUploadDeleted(uploadId: string, leaseId: string): Promise<boolean>;
+  markUploadDeletionFailed(uploadId: string, leaseId: string, attempts: number, error: string): Promise<boolean>;
   getSubmissionByAccessToken(submissionId: string, accessTokenHash: string): Promise<{
     submission: SubmissionRecord;
     allowedOrigins: string[];
@@ -327,9 +341,10 @@ export interface Store {
   setFormStatus(publicKey: string, status: "active" | "disabled"): Promise<boolean>;
   listSubmissions(publicKey: string, limit: number): Promise<SubmissionRecord[]>;
   listFormSummaries(): Promise<FormSummary[]>;
-  claimJobs(limit: number): Promise<OutboxJob[]>;
-  markJobDelivered(id: string): Promise<void>;
-  markJobFailed(id: string, attempts: number, error: string): Promise<void>;
+  claimJobs(limit: number, workerId?: string, leaseSeconds?: number): Promise<OutboxJob[]>;
+  markJobDelivered(id: string, leaseId: string): Promise<boolean>;
+  markJobFailed(id: string, attempts: number, error: string, leaseId: string): Promise<boolean>;
+  renewJobLease(id: string, leaseId: string, leaseSeconds: number): Promise<boolean>;
   deleteExpiredSubmissions(now: Date): Promise<number>;
   close(): Promise<void>;
 }

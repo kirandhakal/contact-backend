@@ -1212,6 +1212,16 @@ export function buildApp(config: AppConfig, store: Store, dependencies: AppDepen
       return uploadResponse({ id: upload.id, url: upload.url, filename: validated.filename, mimetype: validated.mime, size: buffer.length, expiresAt });
     } catch (error) {
       void deleteFile(stored.objectKey).catch(() => undefined);
+      try {
+        await store.enqueueUploadDeletion(stored.objectKey);
+      } catch (queueError) {
+        request.log.error({
+          event: "upload_deletion_enqueue_failed",
+          route: context.route,
+          publicKey: form.publicKey,
+          reason: queueError instanceof Error ? queueError.message.slice(0, 200) : "unknown"
+        }, "Failed to enqueue deletion for an orphaned upload");
+      }
       request.log.error({ event: "upload_record_failed", route: context.route, publicKey: form.publicKey, reason: error instanceof Error ? error.message : "unknown" }, "Failed to persist upload record");
       return problem(reply, 500, "Upload failed", "The uploaded file could not be recorded. Please try again shortly.", { code: "UPLOAD_RECORD_FAILED" });
     }

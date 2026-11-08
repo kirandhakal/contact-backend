@@ -57,6 +57,36 @@ admin, pending-signup, challenge, or auth-rate-limit records. Run it manually wi
 docker compose --env-file .env.docker exec -T app node scripts/smoke-signup.mjs
 ```
 
+### Worker leases, shutdown, and delivery semantics
+
+Workers claim jobs with PostgreSQL `FOR UPDATE SKIP LOCKED` and store a unique
+worker identity, lease token, and lease expiry. While a delivery is running the
+lease is renewed; if a worker crashes, another worker can reclaim the job only
+after the lease expires. Delivered/failed acknowledgements verify the lease token,
+so a worker that lost ownership cannot overwrite the newer owner's result. Rows
+left `processing` by older versions are recovered after the lease window rather
+than being reset on startup.
+
+`SIGINT` and `SIGTERM` stop new ticks, wait up to `WORKER_SHUTDOWN_TIMEOUT_MS`
+for the active tick, close the pool, and then exit. If the timeout is reached,
+the in-flight lease is left to expire so another worker can recover the job.
+The first signal wins; a second signal does not run shutdown twice. The Docker
+command remains `node dist/worker.js`.
+
+Upload expiry moves pending files to `deleted` and atomically records their
+object keys in `upload_deletion_jobs`. If an uploaded object cannot be recorded
+in the database, the API also queues its key for deletion. Deletion successes
+are recorded, failures use the same exponential backoff pattern, and retries
+continue on later ticks. Deletion is idempotent (a missing object counts as
+success).
+
+Delivery is **at-least-once**, not exactly-once. A crash after a provider accepts
+a message but before the acknowledgement is stored can cause a retry. Webhook
+payloads keep the stable `deliveryId`, custom webhooks also receive an
+`Idempotency-Key`, Twilio requests use `I-Twilio-Idempotency-Token`, and email
+uses a stable `Message-ID`. SMTP, Slack, and Discord incoming webhooks do not
+guarantee provider-side deduplication, so consumers should handle duplicates.
+
 The daily worker cleanup deletes expired pending signups and auth rate limits
 immediately. Authentication challenges are retained for one day after expiry or
 consumption so recently issued reset tokens remain valid; older challenges and

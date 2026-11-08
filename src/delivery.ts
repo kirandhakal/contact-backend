@@ -10,6 +10,12 @@ import { cleanEmailSubject, isSafeWebhookUrl } from "./security.js";
 import { isDiscordWebhook, isSlackWebhook, renderTemplate } from "./integrations.js";
 import type { OutboxJob } from "./types.js";
 
+/**
+ * Delivery is at-least-once. A crash after the provider accepts a message but
+ * before the lease acknowledgement is stored can cause a retry. Stable delivery
+ * IDs and provider idempotency keys reduce, but cannot eliminate, duplicates:
+ * SMTP and incoming-webhook providers do not guarantee exactly-once delivery.
+ */
 export async function deliverJob(job: OutboxJob, config: AppConfig): Promise<void> {
   const c = config as any;
   const enabled = (kind: string) => {
@@ -113,9 +119,12 @@ async function deliverEmail(job: OutboxJob, config: AppConfig): Promise<void> {
   }
   try {
     const from = typeof settings.from === "string" ? settings.from : ((config as any).MAIL_FROM || config.EMAIL_FROM);
+    const fromAddress = typeof from === "string" ? from.match(/<([^>]+)>/)?.[1] ?? from : "";
+    const domain = fromAddress.includes("@") ? fromAddress.split("@").pop()!.replace(/[^A-Za-z0-9.-]/g, "") : "contact.local";
     await transport.sendMail({ from,
       to, subject: cleanEmailSubject(typeof settings.subject === "string" ? renderTemplate(settings.subject, job) : undefined),
-      text: message(job), disableFileAccess: true, disableUrlAccess: true });
+      text: message(job), messageId: `<${job.id}@${domain || "contact.local"}>`,
+      disableFileAccess: true, disableUrlAccess: true });
   } catch (error) {
     // Never persist raw provider responses: they can contain credentials or message data.
     const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
@@ -129,7 +138,8 @@ async function deliverSms(job: OutboxJob, config: AppConfig): Promise<void> {
   if (typeof settings.accountSid !== "string" || !/^AC[a-fA-F0-9]{32}$/.test(settings.accountSid) || !job.destination.secret) throw new Error("Invalid Twilio credentials");
   await postPublic(`https://api.twilio.com/2010-04-01/Accounts/${settings.accountSid}/Messages.json`,
     new URLSearchParams({ To: recipient(job), From: String(settings.from), Body: message(job).slice(0, 1600) }).toString(),
-    { "Content-Type": "application/x-www-form-urlencoded", Authorization: `Basic ${Buffer.from(`${settings.accountSid}:${job.destination.secret}`).toString("base64")}` }, config.WEBHOOK_TIMEOUT_MS);
+    { "Content-Type": "application/x-www-form-urlencoded", Authorization: `Basic ${Buffer.from(`${settings.accountSid}:${job.destination.secret}`).toString("base64")}`,
+      "I-Twilio-Idempotency-Token": job.id }, config.WEBHOOK_TIMEOUT_MS);
 }
 
 async function deliverWhatsapp(job: OutboxJob, config: AppConfig): Promise<void> {
@@ -141,7 +151,8 @@ async function deliverWhatsapp(job: OutboxJob, config: AppConfig): Promise<void>
   const fromWhatsapp = from.startsWith("whatsapp:") ? from : `whatsapp:${from}`;
   await postPublic(`https://api.twilio.com/2010-04-01/Accounts/${settings.accountSid}/Messages.json`,
     new URLSearchParams({ To: toWhatsapp, From: fromWhatsapp, Body: message(job).slice(0, 1600) }).toString(),
-    { "Content-Type": "application/x-www-form-urlencoded", Authorization: `Basic ${Buffer.from(`${settings.accountSid}:${job.destination.secret}`).toString("base64")}` }, config.WEBHOOK_TIMEOUT_MS);
+    { "Content-Type": "application/x-www-form-urlencoded", Authorization: `Basic ${Buffer.from(`${settings.accountSid}:${job.destination.secret}`).toString("base64")}`,
+      "I-Twilio-Idempotency-Token": job.id }, config.WEBHOOK_TIMEOUT_MS);
 }
 
 async function deliverWebhook(job: OutboxJob, config: AppConfig): Promise<void> {
@@ -166,7 +177,13 @@ async function deliverWebhook(job: OutboxJob, config: AppConfig): Promise<void> 
     form: { id: job.form.id, name: job.form.name }, data: job.submission.payload,
     ...(job.destination.config.template ? { message: message(job) } : {}) });
   const signature = createHmac("sha256", job.destination.secret).update(`${timestamp}.${body}`).digest("hex");
-  await postPublic(url, body, { "Content-Type": "application/json", "X-Forms-Timestamp": timestamp, "X-Forms-Signature": `v1=${signature}` }, config.WEBHOOK_TIMEOUT_MS);
+  await postPublic(url, body, {
+    "Content-Type": "application/json",
+    "X-Forms-Timestamp": timestamp,
+    "X-Forms-Signature": `v1=${signature}`,
+    "X-Forms-Delivery-Id": job.id,
+    "Idempotency-Key": job.id
+  }, config.WEBHOOK_TIMEOUT_MS);
 }
 
 function isPublicAddress(address: string): boolean {

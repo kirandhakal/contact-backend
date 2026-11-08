@@ -48,7 +48,7 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)("PostgreSQL management integrati
       const jobs = await store.claimSiteContactJobs(10);
       expect(jobs).toHaveLength(1);
       expect(jobs[0]).toMatchObject({ form: { id: "site-contact", name: "Website contact" }, destination: { kind: "email" }, submission: { payload: message } });
-      await store.markSiteContactJobDelivered(jobs[0].id);
+      await store.markSiteContactJobDelivered(jobs[0].id, jobs[0].leaseId!);
       expect(await store.siteContactDeliveryStatus(jobs[0].submission.id)).toMatchObject([{ kind: "email", status: "delivered", error: null }]);
       const saved = await store.listSiteContacts(1, 20);
       for (const item of saved.messages) await store.deleteSiteContact(item.id);
@@ -148,7 +148,7 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)("PostgreSQL management integrati
       const jobs = await store.claimJobs(10);
       expect(jobs).toHaveLength(1);
       expect(jobs[0].destination.secret).toContain("private-token");
-      await store.markJobDelivered(jobs[0].id);
+      await store.markJobDelivered(jobs[0].id, jobs[0].leaseId!);
       await store.createSubmission({ form, payload: {}, status: "accepted", sourceIpHash: "test", accessTokenHash: "token2", expiresAt: new Date(Date.now() + 60000) });
       expect(await store.claimJobs(10)).toEqual([]);
     } finally { await pool.query("DELETE FROM tenants WHERE id=$1", [tenant]); }
@@ -187,7 +187,7 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)("PostgreSQL management integrati
       const jobs = await store.claimJobs(20);
       expect(jobs.filter(j => j.destination.config.template === "Hello {{name}}")).toHaveLength(2);
       expect(jobs.every(j => j.submission.id === result.submission.id)).toBe(true);
-      for (const job of jobs) await store.markJobDelivered(job.id);
+      for (const job of jobs) await store.markJobDelivered(job.id, job.leaseId!);
       expect((await store.deliveryStatus(publicKey, result.submission.id)).every(d => d.status === "delivered")).toBe(true);
     } finally { await pool.query("DELETE FROM tenants WHERE id=$1", [tenant]); }
   });

@@ -71,8 +71,9 @@ class MemoryStore implements Store {
     this.siteContactDestinations = destinations.map((destination) => ({ id: randomUUID(), formId: "site-contact", kind: destination.kind, config: destination.config, secret: destination.secret ?? null, active: true }));
   }
   async claimSiteContactJobs(): Promise<OutboxJob[]> { return []; }
-  async markSiteContactJobDelivered() {}
-  async markSiteContactJobFailed() {}
+  async markSiteContactJobDelivered() { return true; }
+  async markSiteContactJobFailed() { return true; }
+  async renewSiteContactJobLease() { return true; }
   async siteContactDeliveryStatus() { return []; }
 
   async findReplySubmissions(key: string) { return this.submissions.filter(s => s.formId === this.forms.get(key)?.id && s.status === "accepted").map(s => s.id); }
@@ -467,8 +468,13 @@ class MemoryStore implements Store {
     return [];
   }
 
-  async markJobDelivered() {}
-  async markJobFailed() {}
+  async markJobDelivered() { return true; }
+  async markJobFailed() { return true; }
+  async renewJobLease() { return true; }
+  async enqueueUploadDeletion() {}
+  async claimUploadDeletionJobs() { return []; }
+  async markUploadDeleted() { return true; }
+  async markUploadDeletionFailed() { return true; }
   async deleteExpiredSubmissions() {
     return 0;
   }

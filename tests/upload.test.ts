@@ -242,6 +242,25 @@ describe("media upload endpoints", () => {
     await app.close();
   });
 
+  it("queues deletion for an orphaned object when the upload record cannot be saved", async () => {
+    const { app, form, store } = await seededApp();
+    const enqueued = vi.fn(async () => undefined);
+    store.enqueueUploadDeletion = enqueued;
+    store.createUpload = async () => { throw new Error("database unavailable"); };
+    const multipart = multipartPayload("logo.png", "image/png", PNG_1X1);
+    const response = await app.inject({
+      method: "POST",
+      url: `/v1/forms/${form.publicKey}/upload`,
+      headers: multipart.headers,
+      payload: multipart.payload
+    });
+    expect(response.statusCode).toBe(500);
+    expect(response.json()).toMatchObject({ code: "UPLOAD_RECORD_FAILED" });
+    expect(deleteFile).toHaveBeenCalledWith("uploads/tenant/form/file.png");
+    expect(enqueued).toHaveBeenCalledWith("uploads/tenant/form/file.png");
+    await app.close();
+  });
+
   it("maps OCI failures to 502 without exposing provider detail", async () => {
     uploadFile.mockRejectedValueOnce(new Error("OCI upload failed (403). secret=abc"));
     const { app, form } = await seededApp();

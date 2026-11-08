@@ -43,6 +43,14 @@ const EnvSchema = z.object({
   RATE_LIMIT_MAX: z.coerce.number().int().positive().default(20),
   RETENTION_DAYS: z.coerce.number().int().positive().default(90),
   WORKER_POLL_MS: z.coerce.number().int().positive().default(1000),
+  /** Optional stable identifier. Defaults to a unique host/pid/random identity. */
+  WORKER_ID: z.string().default(""),
+  /** Lease duration for claimed jobs. Renewed while a delivery is in progress. */
+  WORKER_LEASE_SECONDS: z.coerce.number().int().positive().default(60),
+  /** How long shutdown waits for the active tick before closing the pool. */
+  WORKER_SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().positive().default(30000),
+  /** Small batches keep memory bounded on 1 GB VMs. */
+  WORKER_BATCH_SIZE: z.coerce.number().int().positive().max(100).default(10),
   SMTP_URL: z.string().default(""),
   EMAIL_FROM: z.string().default("kirandhakal715@gmail.com"),
   SMTP_TIMEOUT_MS: z.coerce.number().int().positive().default(30000),

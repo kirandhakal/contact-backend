@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { publicDeliveryError } from "../delivery-errors.js";
 import { otpMatches } from "../auth-otp.js";
 import pg from "pg";
@@ -30,6 +31,7 @@ import type {
   VerifyAuthChallengeResult,
   CreateUploadInput,
   MediaAttachmentInput,
+  UploadDeletionJob,
   UploadRecord
 } from "../types.js";
 import { MediaReferenceError, normalizeUploadConfig } from "../media.js";
@@ -152,7 +154,7 @@ export class PostgresStore implements Store {
     }
   }
 
-  async claimSiteContactJobs(limit: number): Promise<OutboxJob[]> {
+  async claimSiteContactJobs(limit: number, workerId = `worker-${randomUUID()}`, leaseSeconds = 60): Promise<OutboxJob[]> {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
@@ -163,20 +165,30 @@ export class PostgresStore implements Store {
           FROM site_contact_outbox_jobs j
           JOIN site_contact_messages m ON m.id=j.message_id
           JOIN site_contact_destinations d ON d.id=j.destination_id
-          WHERE j.status IN ('pending','failed') AND j.available_at <= now()
+          WHERE (
+            j.status IN ('pending','failed') AND j.available_at <= now()
+          ) OR (
+            j.status = 'processing' AND (
+              (j.lease_expires_at IS NOT NULL AND j.lease_expires_at < now())
+              OR (j.lease_expires_at IS NULL AND j.updated_at < now() - ($3 || ' seconds')::interval)
+            )
+          )
           ORDER BY j.available_at ASC LIMIT $1 FOR UPDATE OF j SKIP LOCKED
         )
-        UPDATE site_contact_outbox_jobs j SET status='processing',updated_at=now()
+        UPDATE site_contact_outbox_jobs j
+        SET status='processing',locked_by=$2,lease_id=gen_random_uuid(),
+            lease_expires_at=now()+($3 || ' seconds')::interval,updated_at=now()
         FROM claimed WHERE j.id=claimed.id
         RETURNING j.id,claimed.attempts,claimed.message_id,claimed.name,claimed.email,claimed.message,claimed.created_at,
-          claimed.destination_id,claimed.kind,claimed.config,claimed.secret,claimed.active`,
-        [limit]
+          claimed.destination_id,claimed.kind,claimed.config,claimed.secret,claimed.active,j.lease_id`,
+        [limit, workerId, leaseSeconds]
       );
       const jobs = result.rows.map((row) => {
         const createdAt = row.created_at instanceof Date ? row.created_at.toISOString() : String(row.created_at);
         return {
           id: row.id,
           attempts: Number(row.attempts),
+          leaseId: row.lease_id as string,
           submission: {
             id: row.message_id,
             tenantId: "",
@@ -202,19 +214,37 @@ export class PostgresStore implements Store {
     }
   }
 
-  async markSiteContactJobDelivered(id: string): Promise<void> {
-    await this.pool.query("UPDATE site_contact_outbox_jobs SET status='delivered',updated_at=now() WHERE id=$1", [id]);
+  async markSiteContactJobDelivered(id: string, leaseId: string): Promise<boolean> {
+    const result = await this.pool.query(
+      `UPDATE site_contact_outbox_jobs
+       SET status='delivered',locked_by=NULL,lease_id=NULL,lease_expires_at=NULL,updated_at=now()
+       WHERE id=$1 AND lease_id=$2 AND status='processing'`,
+      [id, leaseId]
+    );
+    return (result.rowCount ?? 0) === 1;
   }
 
-  async markSiteContactJobFailed(id: string, attempts: number, error: string): Promise<void> {
+  async markSiteContactJobFailed(id: string, attempts: number, error: string, leaseId: string): Promise<boolean> {
     const dead = attempts >= 8;
     const delaySeconds = Math.min(3600, 10 * 2 ** Math.max(0, attempts - 1));
-    await this.pool.query(
+    const result = await this.pool.query(
       `UPDATE site_contact_outbox_jobs
-       SET status=$2,attempts=$3,available_at=now()+($4 || ' seconds')::interval,last_error=$5,updated_at=now()
-       WHERE id=$1`,
-      [id, dead ? "dead" : "failed", attempts, delaySeconds, error.slice(0, 1000)]
+       SET status=$2,attempts=$3,available_at=now()+($4 || ' seconds')::interval,last_error=$5,
+           locked_by=NULL,lease_id=NULL,lease_expires_at=NULL,updated_at=now()
+       WHERE id=$1 AND lease_id=$6 AND status='processing'`,
+      [id, dead ? "dead" : "failed", attempts, delaySeconds, error.slice(0, 1000), leaseId]
     );
+    return (result.rowCount ?? 0) === 1;
+  }
+
+  async renewSiteContactJobLease(id: string, leaseId: string, leaseSeconds: number): Promise<boolean> {
+    const result = await this.pool.query(
+      `UPDATE site_contact_outbox_jobs
+       SET lease_expires_at=now()+($3 || ' seconds')::interval,updated_at=now()
+       WHERE id=$1 AND lease_id=$2 AND status='processing'`,
+      [id, leaseId, leaseSeconds]
+    );
+    return (result.rowCount ?? 0) === 1;
   }
 
   async siteContactDeliveryStatus(messageId: string): Promise<JsonObject[]> {
@@ -1065,7 +1095,7 @@ export class PostgresStore implements Store {
     }));
   }
 
-  async claimJobs(limit: number): Promise<OutboxJob[]> {
+  async claimJobs(limit: number, workerId = `worker-${randomUUID()}`, leaseSeconds = 60): Promise<OutboxJob[]> {
     const client = await this.pool.connect();
     try {
       await client.query("begin");
@@ -1096,13 +1126,22 @@ export class PostgresStore implements Store {
           join submissions s on s.id = j.submission_id
           join forms f on f.id = s.form_id
           join destinations d on d.id = j.destination_id
-          where j.status in ('pending', 'failed') and j.available_at <= now()
+          where (
+            (j.status in ('pending', 'failed') and j.available_at <= now())
+            or (
+              j.status = 'processing' and (
+                (j.lease_expires_at is not null and j.lease_expires_at < now())
+                or (j.lease_expires_at is null and j.updated_at < now() - ($3 || ' seconds')::interval)
+              )
+            )
+          )
           order by j.available_at asc
           limit $1
           for update of j skip locked
         )
         update outbox_jobs j
-        set status = 'processing', updated_at = now()
+        set status = 'processing', locked_by = $2, lease_id = gen_random_uuid(),
+            lease_expires_at = now() + ($3 || ' seconds')::interval, updated_at = now()
         from claimed
         where j.id = claimed.id
         returning
@@ -1125,12 +1164,14 @@ export class PostgresStore implements Store {
           claimed.kind,
           claimed.config,
           claimed.secret,
-          claimed.active`,
-        [limit]
+          claimed.active,
+          j.lease_id`,
+        [limit, workerId, leaseSeconds]
       );
       const jobs = result.rows.map((row) => ({
         id: row.id,
         attempts: Number(row.attempts),
+        leaseId: row.lease_id as string,
         submission: mapSubmission({ ...row, id: row.submission_id }),
         form: { id: row.form_id, name: row.form_name },
         destination: mapDestination(row, this.encryptionKey)
@@ -1145,8 +1186,24 @@ export class PostgresStore implements Store {
     }
   }
 
-  async markJobDelivered(id: string): Promise<void> {
-    await this.pool.query("update outbox_jobs set status = 'delivered', updated_at = now() where id = $1", [id]);
+  async markJobDelivered(id: string, leaseId: string): Promise<boolean> {
+    const result = await this.pool.query(
+      `update outbox_jobs
+       set status = 'delivered', locked_by = null, lease_id = null, lease_expires_at = null, updated_at = now()
+       where id = $1 and lease_id = $2 and status = 'processing'`,
+      [id, leaseId]
+    );
+    return (result.rowCount ?? 0) === 1;
+  }
+
+  async renewJobLease(id: string, leaseId: string, leaseSeconds: number): Promise<boolean> {
+    const result = await this.pool.query(
+      `update outbox_jobs
+       set lease_expires_at = now() + ($3 || ' seconds')::interval, updated_at = now()
+       where id = $1 and lease_id = $2 and status = 'processing'`,
+      [id, leaseId, leaseSeconds]
+    );
+    return (result.rowCount ?? 0) === 1;
   }
 
   async deliveryStatus(publicKey: string, submissionId: string): Promise<JsonObject[]> {
@@ -1203,16 +1260,17 @@ export class PostgresStore implements Store {
     finally { client.release(); }
   }
 
-  async markJobFailed(id: string, attempts: number, error: string): Promise<void> {
+  async markJobFailed(id: string, attempts: number, error: string, leaseId: string): Promise<boolean> {
     const dead = attempts >= 8;
     const delaySeconds = Math.min(3600, 10 * 2 ** Math.max(0, attempts - 1));
-    await this.pool.query(
+    const result = await this.pool.query(
       `update outbox_jobs
        set status = $2, attempts = $3, available_at = now() + ($4 || ' seconds')::interval,
-           last_error = $5, updated_at = now()
-       where id = $1`,
-      [id, dead ? "dead" : "failed", attempts, delaySeconds, error.slice(0, 1000)]
+           last_error = $5, locked_by = null, lease_id = null, lease_expires_at = null, updated_at = now()
+       where id = $1 and lease_id = $6 and status = 'processing'`,
+      [id, dead ? "dead" : "failed", attempts, delaySeconds, error.slice(0, 1000), leaseId]
     );
+    return (result.rowCount ?? 0) === 1;
   }
 
   async createUpload(input: CreateUploadInput): Promise<UploadRecord> {
@@ -1254,14 +1312,93 @@ export class PostgresStore implements Store {
     return Number(result.rows[0]?.total ?? 0);
   }
 
-  async deleteExpiredUploads(now: Date): Promise<UploadRecord[]> {
+  async deleteExpiredUploads(now: Date, limit = 100): Promise<UploadRecord[]> {
     const result = await this.pool.query(
-      `update uploads set status = 'deleted'
-       where status = 'pending' and expires_at <= $1
-       returning *`,
-      [now]
+      `with target as (
+         select id from uploads
+         where status = 'pending' and expires_at <= $1
+         order by expires_at asc
+         limit $2
+         for update skip locked
+       ), expired as (
+         update uploads u set status = 'deleted'
+         from target t
+         where u.id = t.id
+         returning u.*
+       ), queued as (
+         insert into upload_deletion_jobs(upload_id, object_key)
+         select id, object_key from expired
+         on conflict (upload_id) do nothing
+         returning 1
+       )
+       select * from expired`,
+      [now, limit]
     );
     return result.rows.map(mapUpload);
+  }
+
+  async enqueueUploadDeletion(objectKey: string): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO upload_deletion_jobs(upload_id, object_key)
+       VALUES (gen_random_uuid(), $1)
+       ON CONFLICT (upload_id) DO NOTHING`,
+      [objectKey]
+    );
+  }
+
+  async claimUploadDeletionJobs(limit: number, workerId = `worker-${randomUUID()}`, leaseSeconds = 60): Promise<UploadDeletionJob[]> {
+    const result = await this.pool.query(
+      `with claimed as (
+         select upload_id from upload_deletion_jobs
+         where (
+           status in ('pending', 'failed') and available_at <= now()
+         ) or (
+           status = 'processing' and (
+             (lease_expires_at is not null and lease_expires_at < now())
+             or (lease_expires_at is null and updated_at < now() - ($3 || ' seconds')::interval)
+           )
+         )
+         order by available_at asc
+         limit $1
+         for update skip locked
+       )
+       update upload_deletion_jobs j
+       set status = 'processing', locked_by = $2, lease_id = gen_random_uuid(),
+           lease_expires_at = now() + ($3 || ' seconds')::interval, updated_at = now()
+       from claimed c
+       where j.upload_id = c.upload_id
+       returning j.upload_id as "uploadId", j.object_key as "objectKey", j.attempts, j.lease_id as "leaseId"`,
+      [limit, workerId, leaseSeconds]
+    );
+    return result.rows.map((row) => ({
+      uploadId: row.uploadId as string,
+      objectKey: row.objectKey as string,
+      attempts: Number(row.attempts),
+      leaseId: row.leaseId as string
+    }));
+  }
+
+  async markUploadDeleted(uploadId: string, leaseId: string): Promise<boolean> {
+    const result = await this.pool.query(
+      `update upload_deletion_jobs
+       set status = 'deleted', deleted_at = now(), last_error = null,
+           locked_by = null, lease_id = null, lease_expires_at = null, updated_at = now()
+       where upload_id = $1 and lease_id = $2 and status = 'processing'`,
+      [uploadId, leaseId]
+    );
+    return (result.rowCount ?? 0) === 1;
+  }
+
+  async markUploadDeletionFailed(uploadId: string, leaseId: string, attempts: number, error: string): Promise<boolean> {
+    const delaySeconds = Math.min(3600, 10 * 2 ** Math.max(0, attempts - 1));
+    const result = await this.pool.query(
+      `update upload_deletion_jobs
+       set status = 'failed', attempts = $3, available_at = now() + ($4 || ' seconds')::interval,
+           last_error = $5, locked_by = null, lease_id = null, lease_expires_at = null, updated_at = now()
+       where upload_id = $1 and lease_id = $2 and status = 'processing'`,
+      [uploadId, leaseId, attempts, delaySeconds, error.slice(0, 1000)]
+    );
+    return (result.rowCount ?? 0) === 1;
   }
 
   async deleteExpiredSubmissions(now: Date): Promise<number> {
