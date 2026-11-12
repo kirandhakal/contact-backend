@@ -1390,23 +1390,37 @@ export class PostgresStore implements Store {
   }
 
   async markUploadDeletionFailed(uploadId: string, leaseId: string, attempts: number, error: string): Promise<boolean> {
+    const dead = attempts >= 8;
     const delaySeconds = Math.min(3600, 10 * 2 ** Math.max(0, attempts - 1));
     const result = await this.pool.query(
       `update upload_deletion_jobs
-       set status = 'failed', attempts = $3, available_at = now() + ($4 || ' seconds')::interval,
-           last_error = $5, locked_by = null, lease_id = null, lease_expires_at = null, updated_at = now()
+       set status = $3, attempts = $4, available_at = now() + ($5 || ' seconds')::interval,
+           last_error = $6, locked_by = null, lease_id = null, lease_expires_at = null, updated_at = now()
        where upload_id = $1 and lease_id = $2 and status = 'processing'`,
-      [uploadId, leaseId, attempts, delaySeconds, error.slice(0, 1000)]
+      [uploadId, leaseId, dead ? "dead" : "failed", attempts, delaySeconds, error.slice(0, 1000)]
     );
     return (result.rowCount ?? 0) === 1;
   }
 
   async deleteExpiredSubmissions(now: Date): Promise<number> {
+    // Attached uploads outlive their own expiry because a submission references
+    // them. When the submission expires, transition those uploads to "deleted"
+    // in the same statement; the uploads trigger enqueues object deletion.
     const result = await this.pool.query(
-      "update submissions set status = 'deleted', payload = '{}'::jsonb where status <> 'deleted' and expires_at <= $1",
+      `with expired as (
+         update submissions set status = 'deleted', payload = '{}'::jsonb
+         where status <> 'deleted' and expires_at <= $1
+         returning id
+       ), expired_uploads as (
+         update uploads u set status = 'deleted'
+         from expired e
+         where u.submission_id = e.id and u.status = 'attached'
+         returning u.id
+       )
+       select count(*)::int as count from expired`,
       [now]
     );
-    return result.rowCount ?? 0;
+    return Number(result.rows[0]?.count ?? 0);
   }
 
   async close(): Promise<void> {

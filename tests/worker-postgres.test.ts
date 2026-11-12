@@ -257,4 +257,71 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)("PostgreSQL worker leases and ob
 
     expect(await storeA.deleteExpiredUploads(now)).toEqual([]);
   });
+
+  it("deletes attached uploads when their submission expires", async () => {
+    const tenantId = await storeA.createTenant(`Expiry ${randomUUID()}`);
+    tenantIds.push(tenantId);
+    const form = await storeA.createForm({
+      tenantName: `Expiry ${tenantId}`,
+      tenantId,
+      name: `Expiry ${randomUUID()}`,
+      allowedOrigins: ["https://example.com"],
+      schema: { type: "object" }
+    }, `cf_${randomUUID()}`);
+    const upload = await storeA.createUpload({
+      tenantId, formId: form.id, objectKey: `uploads/${tenantId}/${form.id}/attached-${randomUUID()}.txt`,
+      url: "https://example.com/attached.txt", originalFilename: "attached.txt", mimeType: "text/plain",
+      sizeBytes: 1, expiresAt: new Date(Date.now() + 60000)
+    });
+    uploadIds.push(upload.id);
+
+    const { submission } = await storeA.createSubmission({
+      form,
+      payload: { attachment: upload.id },
+      skipAutomatic: true,
+      status: "accepted",
+      sourceIpHash: "test",
+      accessTokenHash: "test",
+      expiresAt: new Date(Date.now() + 60000),
+      media: [{ uploadId: upload.id, fieldKey: "attachment" }]
+    });
+
+    const attached = await pool.query("SELECT status FROM uploads WHERE id=$1", [upload.id]);
+    expect(attached.rows[0].status).toBe("attached");
+
+    await pool.query("UPDATE submissions SET expires_at = now() - interval '1 second' WHERE id=$1", [submission.id]);
+    expect(await storeA.deleteExpiredSubmissions(new Date())).toBe(1);
+
+    const after = await pool.query("SELECT status FROM uploads WHERE id=$1", [upload.id]);
+    expect(after.rows[0].status).toBe("deleted");
+    const queued = await pool.query("SELECT object_key FROM upload_deletion_jobs WHERE upload_id=$1", [upload.id]);
+    expect(queued.rows[0]?.object_key).toBe(upload.objectKey);
+  });
+
+  it("dead-letters object deletion after repeated failures", async () => {
+    const tenantId = await storeA.createTenant(`Dead ${randomUUID()}`);
+    tenantIds.push(tenantId);
+    const form = await storeA.createForm({
+      tenantName: `Dead ${tenantId}`,
+      tenantId,
+      name: `Dead ${randomUUID()}`,
+      allowedOrigins: ["https://example.com"],
+      schema: { type: "object" }
+    }, `cf_${randomUUID()}`);
+    const upload = await storeA.createUpload({
+      tenantId, formId: form.id, objectKey: `uploads/${tenantId}/${form.id}/dead-${randomUUID()}.txt`,
+      url: "https://example.com/dead.txt", originalFilename: "dead.txt", mimeType: "text/plain",
+      sizeBytes: 1, expiresAt: new Date(Date.now() - 1000)
+    });
+    uploadIds.push(upload.id);
+
+    expect((await storeA.deleteExpiredUploads(new Date())).map((record) => record.id)).toContain(upload.id);
+    const [job] = await storeA.claimUploadDeletionJobs(10, "worker-a", 60);
+    expect(job.uploadId).toBe(upload.id);
+
+    expect(await storeA.markUploadDeletionFailed(job.uploadId, job.leaseId, 8, "permanent storage failure")).toBe(true);
+    const row = await pool.query("SELECT status,attempts,last_error FROM upload_deletion_jobs WHERE upload_id=$1", [upload.id]);
+    expect(row.rows[0]).toMatchObject({ status: "dead", attempts: 8, last_error: "permanent storage failure" });
+    expect(await storeA.claimUploadDeletionJobs(10, "worker-a", 60)).toEqual([]);
+  });
 });
