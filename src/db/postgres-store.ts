@@ -1009,13 +1009,46 @@ export class PostgresStore implements Store {
   }
 
   async deleteSubmission(submissionId: string): Promise<boolean> {
-    const result = await this.pool.query("delete from submissions where id=$1", [submissionId]);
-    return Boolean(result.rowCount);
+    const client = await this.pool.connect();
+    try {
+      await client.query("begin");
+      // Mark attachments deleted before the row disappears; the FK would
+      // otherwise null submission_id and leave the uploads unreachable. The
+      // uploads trigger enqueues object deletion.
+      await client.query(
+        "update uploads set status = 'deleted' where submission_id = $1 and status = 'attached'",
+        [submissionId]
+      );
+      const result = await client.query("delete from submissions where id=$1", [submissionId]);
+      await client.query("commit");
+      return Boolean(result.rowCount);
+    } catch (error) {
+      await client.query("rollback");
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   async updateSubmission(submissionId: string, payload: JsonObject, status: SubmissionStatus): Promise<boolean> {
-    const result = await this.pool.query("update submissions set payload=$2, status=$3 where id=$1", [submissionId, payload, status]);
-    return (result.rowCount ?? 0) > 0;
+    const client = await this.pool.connect();
+    try {
+      await client.query("begin");
+      const result = await client.query("update submissions set payload=$2, status=$3 where id=$1", [submissionId, payload, status]);
+      if ((result.rowCount ?? 0) > 0 && status === "deleted") {
+        await client.query(
+          "update uploads set status = 'deleted' where submission_id = $1 and status = 'attached'",
+          [submissionId]
+        );
+      }
+      await client.query("commit");
+      return (result.rowCount ?? 0) > 0;
+    } catch (error) {
+      await client.query("rollback");
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   async setFormStatus(publicKey: string, status: "active" | "disabled"): Promise<boolean> {

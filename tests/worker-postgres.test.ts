@@ -121,6 +121,47 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)("PostgreSQL worker leases and ob
     return table === "outbox" ? store.renewJobLease(id, leaseId, leaseSeconds) : store.renewSiteContactJobLease(id, leaseId, leaseSeconds);
   }
 
+  async function createUploadFixture() {
+    const tenantId = await storeA.createTenant(`Admin ${randomUUID()}`);
+    tenantIds.push(tenantId);
+    const form = await storeA.createForm({
+      tenantName: `Admin ${tenantId}`,
+      tenantId,
+      name: `Admin ${randomUUID()}`,
+      allowedOrigins: ["https://example.com"],
+      schema: { type: "object" }
+    }, `cf_${randomUUID()}`);
+    const upload = await storeA.createUpload({
+      tenantId, formId: form.id, objectKey: `uploads/${tenantId}/${form.id}/admin-${randomUUID()}.txt`,
+      url: "https://example.com/admin.txt", originalFilename: "admin.txt", mimeType: "text/plain",
+      sizeBytes: 1, expiresAt: new Date(Date.now() + 60000)
+    });
+    uploadIds.push(upload.id);
+    return { tenantId, form, upload };
+  }
+
+  async function createSubmissionWithUpload() {
+    const { form, upload } = await createUploadFixture();
+    const { submission } = await storeA.createSubmission({
+      form,
+      payload: { attachment: upload.id },
+      skipAutomatic: true,
+      status: "accepted",
+      sourceIpHash: "test",
+      accessTokenHash: "test",
+      expiresAt: new Date(Date.now() + 60000),
+      media: [{ uploadId: upload.id, fieldKey: "attachment" }]
+    });
+    return { upload, submission };
+  }
+
+  async function expectUploadDeletedAndQueued(upload: { id: string; objectKey: string }) {
+    const row = await pool.query("SELECT status FROM uploads WHERE id=$1", [upload.id]);
+    expect(row.rows[0]?.status).toBe("deleted");
+    const job = await pool.query("SELECT object_key FROM upload_deletion_jobs WHERE upload_id=$1", [upload.id]);
+    expect(job.rows[0]?.object_key).toBe(upload.objectKey);
+  }
+
   it.each<JobTable>(["outbox", "site"])("concurrent workers cannot claim the same %s job", async (table) => {
     const jobIds = await createFixture(table, 1);
     const [first, second] = await Promise.all([
@@ -323,5 +364,71 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)("PostgreSQL worker leases and ob
     const row = await pool.query("SELECT status,attempts,last_error FROM upload_deletion_jobs WHERE upload_id=$1", [upload.id]);
     expect(row.rows[0]).toMatchObject({ status: "dead", attempts: 8, last_error: "permanent storage failure" });
     expect(await storeA.claimUploadDeletionJobs(10, "worker-a", 60)).toEqual([]);
+  });
+
+  it("deletes attached uploads when an admin hard-deletes a submission", async () => {
+    const { upload, submission } = await createSubmissionWithUpload();
+
+    expect(await storeA.deleteSubmission(submission.id)).toBe(true);
+
+    await expectUploadDeletedAndQueued(upload);
+    const gone = await pool.query("SELECT count(*)::int AS count FROM submissions WHERE id=$1", [submission.id]);
+    expect(gone.rows[0].count).toBe(0);
+  });
+
+  it("deletes attached uploads when an admin marks a submission deleted", async () => {
+    const { upload, submission } = await createSubmissionWithUpload();
+
+    expect(await storeA.updateSubmission(submission.id, { attachment: upload.id }, "deleted")).toBe(true);
+
+    await expectUploadDeletedAndQueued(upload);
+    const row = await pool.query("SELECT status FROM submissions WHERE id=$1", [submission.id]);
+    expect(row.rows[0]?.status).toBe("deleted");
+  });
+
+  it("backfills orphaned attached uploads idempotently", async () => {
+    const { upload } = await createUploadFixture();
+    await pool.query("UPDATE uploads SET status = 'attached', submission_id = NULL WHERE id=$1", [upload.id]);
+    const migration = await readFile(
+      new URL("../migrations/016_backfill_orphaned_attached_uploads.sql", import.meta.url),
+      "utf8"
+    );
+
+    await pool.query(migration);
+
+    await expectUploadDeletedAndQueued(upload);
+    const first = await pool.query("SELECT count(*)::int AS count FROM upload_deletion_jobs WHERE upload_id=$1", [upload.id]);
+    expect(first.rows[0].count).toBe(1);
+
+    await pool.query(migration);
+
+    const second = await pool.query("SELECT count(*)::int AS count FROM upload_deletion_jobs WHERE upload_id=$1", [upload.id]);
+    expect(second.rows[0].count).toBe(1);
+    const status = await pool.query("SELECT status FROM uploads WHERE id=$1", [upload.id]);
+    expect(status.rows[0]?.status).toBe("deleted");
+  });
+
+  it("deletes a submission without uploads and enqueues nothing", async () => {
+    const tenantId = await storeA.createTenant(`NoUploads ${randomUUID()}`);
+    tenantIds.push(tenantId);
+    const form = await storeA.createForm({
+      tenantName: `NoUploads ${tenantId}`,
+      tenantId,
+      name: `NoUploads ${randomUUID()}`,
+      allowedOrigins: ["https://example.com"],
+      schema: { type: "object" }
+    }, `cf_${randomUUID()}`);
+    const { submission } = await storeA.createSubmission({
+      form, payload: {}, skipAutomatic: true, status: "accepted", sourceIpHash: "test",
+      accessTokenHash: "test", expiresAt: new Date(Date.now() + 60000)
+    });
+    const before = await pool.query("SELECT count(*)::int AS count FROM upload_deletion_jobs");
+
+    expect(await storeA.deleteSubmission(submission.id)).toBe(true);
+
+    const after = await pool.query("SELECT count(*)::int AS count FROM upload_deletion_jobs");
+    expect(after.rows[0].count).toBe(before.rows[0].count);
+    const gone = await pool.query("SELECT count(*)::int AS count FROM submissions WHERE id=$1", [submission.id]);
+    expect(gone.rows[0].count).toBe(0);
   });
 });
