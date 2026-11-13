@@ -504,7 +504,7 @@ function latestCode(store: MemoryStore, email: string, kind: AuthEmailMessage["k
 }
 
 async function completeSignup(app: ReturnType<typeof makeApp>, store: MemoryStore, payload: Record<string, unknown>) {
-  const signup = await app.inject({ method: "POST", url: "/v1/auth/signup", headers: { origin: config.PUBLIC_BASE_URL }, payload });
+  const signup = await app.inject({ method: "POST", url: "/v1/auth/signup", headers: { origin: config.PUBLIC_BASE_URL }, payload: { acceptedTerms: true, ...payload } });
   expect(signup.statusCode).toBe(202);
   const verify = await app.inject({ method: "POST", url: "/v1/auth/signup/verify", headers: { origin: config.PUBLIC_BASE_URL },
     payload: { challengeId: signup.json().challengeId, code: latestCode(store, String(payload.email), "signup_code") } });
@@ -1104,11 +1104,23 @@ describe("email-verified auth", () => {
     const store = new MemoryStore();
     const app = makeApp(store, { ...config, TURNSTILE_SECRET_KEY: "test-secret" });
     try {
-      const payload = { workspaceName: "Bot Studio", email: "bot@studio.test", password: "a-secure-password" };
+      const payload = { workspaceName: "Bot Studio", email: "bot@studio.test", password: "a-secure-password", acceptedTerms: true };
       const response = await app.inject({ method: "POST", url: "/v1/auth/signup", headers: { origin: config.PUBLIC_BASE_URL }, payload });
       expect(response.statusCode).toBe(403);
       expect(response.json().detail).toBe("Bot verification failed.");
       expect(store.pendingSignups.size).toBe(0);
+    } finally { await app.close(); }
+  });
+
+  it("requires explicit consent before creating a pending signup", async () => {
+    const store = new MemoryStore(); const app = makeApp(store);
+    try {
+      const response = await app.inject({ method: "POST", url: "/v1/auth/signup", headers: { origin: config.PUBLIC_BASE_URL },
+        payload: { workspaceName: "No Consent", email: "noconsent@studio.test", password: "a-secure-password" } });
+      expect(response.statusCode).toBe(422);
+      expect(response.json()).toMatchObject({ code: "CONSENT_REQUIRED" });
+      expect(store.pendingSignups.size).toBe(0);
+      expect(store.authEmails).toEqual([]);
     } finally { await app.close(); }
   });
 
@@ -1117,10 +1129,10 @@ describe("email-verified auth", () => {
     try {
       const headers = { origin: config.PUBLIC_BASE_URL };
       for (const payload of [
-        {},
-        { workspaceName: "Studio", email: "not-an-email", password: "a-secure-password" },
-        { workspaceName: "!!!", email: "workspace@studio.test", password: "a-secure-password" },
-        { workspaceName: "Studio", email: "password@studio.test", password: "short" }
+        { acceptedTerms: true },
+        { workspaceName: "Studio", email: "not-an-email", password: "a-secure-password", acceptedTerms: true },
+        { workspaceName: "!!!", email: "workspace@studio.test", password: "a-secure-password", acceptedTerms: true },
+        { workspaceName: "Studio", email: "password@studio.test", password: "short", acceptedTerms: true }
       ]) {
         const response = await app.inject({ method: "POST", url: "/v1/auth/signup", headers, payload });
         expect(response.statusCode).toBe(422);
@@ -1137,7 +1149,7 @@ describe("email-verified auth", () => {
 
   it("keeps signup pending until the correct code is verified", async () => {
     const store = new MemoryStore(); const app = makeApp(store);
-    const payload = { workspaceName: "Secure Studio", email: "secure@studio.test", password: "a-secure-password" };
+    const payload = { workspaceName: "Secure Studio", email: "secure@studio.test", password: "a-secure-password", acceptedTerms: true };
     const signup = await app.inject({ method: "POST", url: "/v1/auth/signup", headers: { origin: config.PUBLIC_BASE_URL }, payload });
     expect(signup.statusCode).toBe(202);
     expect(signup.json()).toMatchObject({ message: "We've received your request. If the email is eligible, you will receive a verification code shortly." });
@@ -1171,7 +1183,7 @@ describe("email-verified auth", () => {
     await completeSignup(app, store, { workspaceName: "Existing Studio", email: "existing@studio.test", password: "a-secure-password" });
     const before = store.authEmails.length;
     const response = await app.inject({ method: "POST", url: "/v1/auth/signup", headers: { origin: config.PUBLIC_BASE_URL },
-      payload: { workspaceName: "Different Studio", email: "existing@studio.test", password: "different-password" } });
+      payload: { workspaceName: "Different Studio", email: "existing@studio.test", password: "different-password", acceptedTerms: true } });
     expect(response.statusCode).toBe(202);
     expect(response.json().message).toBe("We've received your request. If the email is eligible, you will receive a verification code shortly.");
     expect(store.authEmails).toHaveLength(before);
@@ -1183,7 +1195,7 @@ describe("email-verified auth", () => {
   it("rotates expired signup codes, invalidates old codes, and resends after the cooldown", async () => {
     let clock = new Date("2026-01-01T00:00:00Z");
     const store = new MemoryStore(); const app = makeApp(store, config, () => clock);
-    const payload = { workspaceName: "Timed Studio", email: "timed@studio.test", password: "a-secure-password" };
+    const payload = { workspaceName: "Timed Studio", email: "timed@studio.test", password: "a-secure-password", acceptedTerms: true };
     const signup = await app.inject({ method: "POST", url: "/v1/auth/signup", headers: { origin: config.PUBLIC_BASE_URL }, payload });
     const challengeId = signup.json().challengeId as string;
     const firstCode = latestCode(store, payload.email, "signup_code");
@@ -1196,7 +1208,7 @@ describe("email-verified auth", () => {
     expect((await app.inject({ method: "POST", url: "/v1/auth/signup/verify", headers: { origin: config.PUBLIC_BASE_URL }, payload: { challengeId, code: secondCode } })).statusCode).toBe(200);
 
     const other = await app.inject({ method: "POST", url: "/v1/auth/signup", headers: { origin: config.PUBLIC_BASE_URL },
-      payload: { workspaceName: "Expired Studio", email: "expired@studio.test", password: "a-secure-password" } });
+      payload: { workspaceName: "Expired Studio", email: "expired@studio.test", password: "a-secure-password", acceptedTerms: true } });
     clock = new Date(clock.getTime() + 301_000);
     const expired = await app.inject({ method: "POST", url: "/v1/auth/signup/verify", headers: { origin: config.PUBLIC_BASE_URL },
       payload: { challengeId: other.json().challengeId, code: latestCode(store, "expired@studio.test", "signup_code") } });
@@ -1209,11 +1221,11 @@ describe("email-verified auth", () => {
     let clock = new Date("2026-01-01T00:00:00Z");
     const store = new MemoryStore(); const app = makeApp(store, config, () => clock);
     const first = await app.inject({ method: "POST", url: "/v1/auth/signup", headers: { origin: config.PUBLIC_BASE_URL },
-      payload: { workspaceName: "First Studio", email: "restart@studio.test", password: "first-password" } });
+      payload: { workspaceName: "First Studio", email: "restart@studio.test", password: "first-password", acceptedTerms: true } });
     expect(first.statusCode).toBe(202);
     clock = new Date(clock.getTime() + 61_000);
     const second = await app.inject({ method: "POST", url: "/v1/auth/signup", headers: { origin: config.PUBLIC_BASE_URL },
-      payload: { workspaceName: "Second Studio", email: "restart@studio.test", password: "second-password" } });
+      payload: { workspaceName: "Second Studio", email: "restart@studio.test", password: "second-password", acceptedTerms: true } });
     expect(second.statusCode).toBe(202);
     expect(second.json().challengeId).not.toBe(first.json().challengeId);
     const verify = await app.inject({ method: "POST", url: "/v1/auth/signup/verify", headers: { origin: config.PUBLIC_BASE_URL },
@@ -1283,11 +1295,11 @@ describe("email-verified auth", () => {
     const store = new MemoryStore(); const app = makeApp(store);
     for (let index = 0; index < 5; index++) {
       const response = await app.inject({ method: "POST", url: "/v1/auth/signup", headers: { origin: config.PUBLIC_BASE_URL },
-        payload: { workspaceName: `Studio ${index}`, email: `limited${index}@studio.test`, password: "a-secure-password" } });
+        payload: { workspaceName: `Studio ${index}`, email: `limited${index}@studio.test`, password: "a-secure-password", acceptedTerms: true } });
       expect(response.statusCode).toBe(202);
     }
     const limited = await app.inject({ method: "POST", url: "/v1/auth/signup", headers: { origin: config.PUBLIC_BASE_URL },
-      payload: { workspaceName: "One More", email: "limited-five@studio.test", password: "a-secure-password" } });
+      payload: { workspaceName: "One More", email: "limited-five@studio.test", password: "a-secure-password", acceptedTerms: true } });
     expect(limited.statusCode).toBe(429);
     expect(limited.headers["retry-after"]).toBeDefined();
     expect(store.pendingSignups.size).toBe(5);
