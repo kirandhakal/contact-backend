@@ -55,7 +55,9 @@ const config = {
   OTP_RESEND_SECONDS: 60,
   OTP_MAX_ATTEMPTS: 5,
   AUTH_RESET_TOKEN_TTL_SECONDS: 600,
-  AUTH_MIN_RESPONSE_MS: 0
+  AUTH_MIN_RESPONSE_MS: 0,
+  TERMS_VERSION: "2026-11-13",
+  PRIVACY_VERSION: "2026-11-13"
 } as any;
 
 class MemoryStore implements Store {
@@ -223,6 +225,8 @@ class MemoryStore implements Store {
     if (!pending || pending.expiresAt <= input.now) return { status: "expired" as const, attemptsRemaining: 0, retryAfterSeconds: 0 };
     if (this.admins.has(challenge.email)) return { status: "invalid" as const, attemptsRemaining: 0, retryAfterSeconds: 0 };
     const { tenantId } = await this.createSiteAccount(pending.workspaceName, challenge.email, pending.passwordHash);
+    const created = this.admins.get(challenge.email);
+    if (created) this.consentRecords.set(created.id, { termsVersion: "2026-11-13", privacyVersion: "2026-11-13", acceptedAt: input.now });
     challenge.consumedAt = input.now; challenge.pendingSignupId = null;
     this.pendingSignups.delete(challenge.email);
     return { status: "ok" as const, attemptsRemaining: 0, retryAfterSeconds: 0, tenantId };
@@ -271,6 +275,11 @@ class MemoryStore implements Store {
     this.admins.set(email, { id: randomUUID(), email, passwordHash, role, tenantId });
   }
   async getAdminByEmail(email: string) { return this.admins.get(email) ?? null; }
+  consentRecords = new Map<string, { termsVersion: string; privacyVersion: string; acceptedAt: Date }>();
+  async recordConsent(input: { adminId: string; termsVersion: string; privacyVersion: string; ipAddress?: string | null; userAgent?: string | null; now: Date }) {
+    this.consentRecords.set(input.adminId, { termsVersion: input.termsVersion, privacyVersion: input.privacyVersion, acceptedAt: input.now });
+  }
+  async getLatestConsent(adminId: string) { return this.consentRecords.get(adminId) ?? null; }
   async createAdminSession(adminId: string, tokenHash: string) { this.sessions.set(tokenHash, adminId); }
   async getAdminBySession(tokenHash: string) {
     return [...this.admins.values()].find((admin) => admin.id === this.sessions.get(tokenHash)) ?? null;

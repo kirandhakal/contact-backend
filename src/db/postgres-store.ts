@@ -358,15 +358,18 @@ export class PostgresStore implements Store {
       let pendingId: string;
       if (!pending.rowCount) {
         const inserted = await client.query(
-          `insert into pending_signups(email,workspace_name,password_hash,phone,expires_at)
-           values($1,$2,$3,$4,$5) returning id`,
-          [input.email, input.workspaceName, input.passwordHash, input.phone ?? null, new Date(input.now.getTime() + 24 * 60 * 60 * 1000)]
+          `insert into pending_signups(email,workspace_name,password_hash,phone,expires_at,terms_version,privacy_version,accepted_ip,accepted_user_agent,accepted_at)
+           values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) returning id`,
+          [input.email, input.workspaceName, input.passwordHash, input.phone ?? null, new Date(input.now.getTime() + 24 * 60 * 60 * 1000),
+           input.termsVersion, input.privacyVersion, input.acceptedIp ?? null, input.acceptedUserAgent ?? null, input.now]
         );
         pendingId = inserted.rows[0].id;
       } else {
         await client.query(
-          "update pending_signups set workspace_name=$2,password_hash=$3,phone=$4,expires_at=$5,created_at=$6 where id=$1",
-          [pending.rows[0].id, input.workspaceName, input.passwordHash, input.phone ?? null, new Date(input.now.getTime() + 24 * 60 * 60 * 1000), input.now]
+          `update pending_signups set workspace_name=$2,password_hash=$3,phone=$4,expires_at=$5,created_at=$6,
+             terms_version=$7,privacy_version=$8,accepted_ip=$9,accepted_user_agent=$10,accepted_at=$11 where id=$1`,
+          [pending.rows[0].id, input.workspaceName, input.passwordHash, input.phone ?? null, new Date(input.now.getTime() + 24 * 60 * 60 * 1000), input.now,
+           input.termsVersion, input.privacyVersion, input.acceptedIp ?? null, input.acceptedUserAgent ?? null, input.now]
         );
         pendingId = pending.rows[0].id;
       }
@@ -475,7 +478,8 @@ export class PostgresStore implements Store {
     try {
       await client.query("begin");
       const result = await client.query(
-        `select c.*, p.workspace_name, p.password_hash, p.phone, p.expires_at as pending_expires_at
+        `select c.*, p.workspace_name, p.password_hash, p.phone, p.expires_at as pending_expires_at,
+                p.terms_version, p.privacy_version, p.accepted_ip, p.accepted_user_agent, p.accepted_at
          from auth_challenges c left join pending_signups p on p.id=c.pending_signup_id
          where c.id=$1 and c.purpose='signup' for update of c`,
         [input.challengeId]
@@ -495,14 +499,21 @@ export class PostgresStore implements Store {
       }
       try {
         const tenant = await client.query("insert into tenants(name) values($1) returning id", [tenantSlug(row.workspace_name)]);
-        await client.query(
-          "insert into admin_users(email,password_hash,role,tenant_id) values($1,$2,'tenant',$3)",
+        const admin = await client.query(
+          "insert into admin_users(email,password_hash,role,tenant_id) values($1,$2,'tenant',$3) returning id",
           [row.email, row.password_hash, tenant.rows[0].id]
         );
+        if (row.terms_version && row.privacy_version) {
+          await client.query(
+            `insert into consent_records(admin_id,terms_version,privacy_version,ip_address,user_agent,accepted_at)
+             values($1,$2,$3,$4,$5,$6)`,
+            [admin.rows[0].id, row.terms_version, row.privacy_version, row.accepted_ip ?? null, row.accepted_user_agent ?? null, row.accepted_at ?? input.now]
+          );
+        }
         await client.query("update auth_challenges set consumed_at=$2, pending_signup_id=null where id=$1", [row.id, input.now]);
         await client.query("delete from pending_signups where id=$1", [row.pending_signup_id]);
         await client.query("commit");
-        return { status: "ok", attemptsRemaining: 0, retryAfterSeconds: 0, tenantId: tenant.rows[0].id as string };
+        return { status: "ok", attemptsRemaining: 0, retryAfterSeconds: 0, tenantId: tenant.rows[0].id as string, adminId: admin.rows[0].id as string };
       } catch (error) {
         await client.query("rollback");
         if (typeof error === "object" && error && "code" in error && error.code === "23505") {
@@ -852,6 +863,24 @@ export class PostgresStore implements Store {
     if (!result.rowCount) return null;
     const row = result.rows[0];
     return { id: row.id as string, email: row.email as string, passwordHash: row.password_hash as string, role: row.role as AdminRole, tenantId: row.tenant_id as string | null };
+  }
+
+  async recordConsent(input: { adminId: string; termsVersion: string; privacyVersion: string; ipAddress?: string | null; userAgent?: string | null; now: Date }): Promise<void> {
+    await this.pool.query(
+      `insert into consent_records(admin_id,terms_version,privacy_version,ip_address,user_agent,accepted_at)
+       values($1,$2,$3,$4,$5,$6)`,
+      [input.adminId, input.termsVersion, input.privacyVersion, input.ipAddress ?? null, input.userAgent ?? null, input.now]
+    );
+  }
+
+  async getLatestConsent(adminId: string): Promise<{ termsVersion: string; privacyVersion: string; acceptedAt: Date } | null> {
+    const result = await this.pool.query(
+      "select terms_version, privacy_version, accepted_at from consent_records where admin_id=$1 order by accepted_at desc limit 1",
+      [adminId]
+    );
+    if (!result.rowCount) return null;
+    const row = result.rows[0];
+    return { termsVersion: row.terms_version as string, privacyVersion: row.privacy_version as string, acceptedAt: new Date(row.accepted_at) };
   }
 
   async createAdminSession(adminId: string, tokenHash: string, expiresAt: Date): Promise<void> {

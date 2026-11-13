@@ -194,6 +194,10 @@ export interface StartSignupChallengeInput {
   email: string;
   passwordHash: string;
   phone?: string | null;
+  termsVersion: string;
+  privacyVersion: string;
+  acceptedIp?: string | null;
+  acceptedUserAgent?: string | null;
   otpHash: string;
   expiresAt: Date;
   resendAvailableAt: Date;
@@ -323,6 +327,15 @@ export interface Store {
   } | null>;
   createAdmin(email: string, passwordHash: string, role: AdminRole, tenantId: string | null): Promise<void>;
   getAdminByEmail(email: string): Promise<AdminRecord | null>;
+  recordConsent(input: {
+    adminId: string;
+    termsVersion: string;
+    privacyVersion: string;
+    ipAddress?: string | null;
+    userAgent?: string | null;
+    now: Date;
+  }): Promise<void>;
+  getLatestConsent(adminId: string): Promise<{ termsVersion: string; privacyVersion: string; acceptedAt: Date } | null>;
   createAdminSession(adminId: string, tokenHash: string, expiresAt: Date): Promise<void>;
   getAdminBySession(tokenHash: string): Promise<Omit<AdminRecord, "passwordHash"> | null>;
   deleteAdminSession(tokenHash: string): Promise<void>;
