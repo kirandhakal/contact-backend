@@ -22,6 +22,9 @@ const EnvSchema = z.object({
   OTP_MAX_ATTEMPTS: z.coerce.number().int().positive().default(5),
   AUTH_RESET_TOKEN_TTL_SECONDS: z.coerce.number().int().positive().default(600),
   AUTH_MIN_RESPONSE_MS: z.coerce.number().int().min(0).default(150),
+  /** Published legal document versions. Bump to force existing users to re-accept. */
+  TERMS_VERSION: z.string().min(1).max(40).default("2026-11-13"),
+  PRIVACY_VERSION: z.string().min(1).max(40).default("2026-11-13"),
   TRUST_PROXY: z.preprocess((value) => {
     if (value === undefined || value === null || value === "") return false;
     const boolean = boolFromEnv(value);

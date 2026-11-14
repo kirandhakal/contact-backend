@@ -421,9 +421,10 @@ export function buildApp(config: AppConfig, store: Store, dependencies: AppDepen
     if (!sameOrigin(request)) return problem(reply, 403, "Forbidden", "Use the hosted admin page.");
     const limit = authTrafficLimiter.check(request.ip);
     if (!limit.allowed) return problem(reply, 429, "Too many attempts", "Try again later.");
-    if (!assertPlainObject(request.body) || Object.keys(request.body).some((key) => !["email", "password", "portal"].includes(key)) ||
+    if (!assertPlainObject(request.body) || Object.keys(request.body).some((key) => !["email", "password", "portal", "rememberMe"].includes(key)) ||
       typeof request.body.email !== "string" || typeof request.body.password !== "string" ||
-      ![undefined, "admin", "tenant"].includes(request.body.portal as string | undefined)) return problem(reply, 400, "Invalid request", "Email and password are required.");
+      ![undefined, "admin", "tenant"].includes(request.body.portal as string | undefined) ||
+      ![undefined, true, false].includes(request.body.rememberMe as boolean | undefined)) return problem(reply, 400, "Invalid request", "Email and password are required.");
     const email = request.body.email.trim().toLowerCase();
     if (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !request.body.password || request.body.password.length > 256) return problem(reply, 400, "Invalid request", "Invalid credentials.");
     const admin = await store.getAdminByEmail(email);
@@ -443,11 +444,15 @@ export function buildApp(config: AppConfig, store: Store, dependencies: AppDepen
     }
     if (!result.allowed || !admin) return problem(reply, 401, "Unauthorized", "Invalid email or password.");
     const token = newSessionToken();
-    await store.createAdminSession(admin.id, hashSessionToken(token), new Date(Date.now() + 8 * 60 * 60 * 1000));
+    const rememberMe = request.body.rememberMe === true;
+    const sessionSeconds = rememberMe ? 30 * 24 * 60 * 60 : 8 * 60 * 60;
+    await store.createAdminSession(admin.id, hashSessionToken(token), new Date(Date.now() + sessionSeconds * 1000));
     const secure = new URL(config.PUBLIC_BASE_URL).protocol === "https:" ? "; Secure" : "";
-    reply.header("Set-Cookie", `contact_admin=${token}; HttpOnly; SameSite=Strict; Path=/v1/admin; Max-Age=28800${secure}`);
+    reply.header("Set-Cookie", `contact_admin=${token}; HttpOnly; SameSite=Strict; Path=/v1/admin; Max-Age=${sessionSeconds}${secure}`);
     reply.header("Cache-Control", "no-store");
-    return { email: admin.email, role: admin.role };
+    const consent = admin.role === "tenant" ? await store.getLatestConsent(admin.id) : null;
+    const requiresConsent = admin.role === "tenant" && (!consent || consent.termsVersion !== config.TERMS_VERSION || consent.privacyVersion !== config.PRIVACY_VERSION);
+    return { email: admin.email, role: admin.role, requiresConsent, termsVersion: config.TERMS_VERSION, privacyVersion: config.PRIVACY_VERSION };
   });
 
   app.post("/v1/auth/signup", async (request, reply) => {
@@ -457,9 +462,13 @@ export function buildApp(config: AppConfig, store: Store, dependencies: AppDepen
       workspaceName: z.string().trim().min(1).max(200),
       email: z.string().trim().email().max(254),
       password: z.string().min(8).max(256),
-      phone: z.string().trim().max(32).optional().or(z.literal(""))
+      phone: z.string().trim().max(32).optional().or(z.literal("")),
+      acceptedTerms: z.boolean().optional()
     }).strict().safeParse(request.body);
     if (!parsed.success) return problem(reply, 422, "Invalid request", "Use a valid workspace, email, and password of at least 8 characters.");
+    if (parsed.data.acceptedTerms !== true) {
+      return problem(reply, 422, "Consent required", "You must accept the Terms and Conditions and the Privacy Policy to create an account.", { code: "CONSENT_REQUIRED" });
+    }
     const workspaceName = tenantSlug(parsed.data.workspaceName);
     const email = normalizeEmail(parsed.data.email);
     const phone = parsed.data.phone?.trim() || null;
@@ -486,6 +495,10 @@ export function buildApp(config: AppConfig, store: Store, dependencies: AppDepen
       email,
       passwordHash: await hashPassword(parsed.data.password),
       phone,
+      termsVersion: config.TERMS_VERSION,
+      privacyVersion: config.PRIVACY_VERSION,
+      acceptedIp: request.ip,
+      acceptedUserAgent: firstHeader(request.headers["user-agent"]) ?? null,
       otpHash: hashOtp(otpKey, "signup", email, challengeId, code),
       expiresAt: new Date(createdAt.getTime() + otpExpirySeconds * 1000),
       resendAvailableAt: new Date(createdAt.getTime() + otpResendSeconds * 1000),
@@ -696,7 +709,39 @@ export function buildApp(config: AppConfig, store: Store, dependencies: AppDepen
     const admin = await adminFor(request);
     if (!admin) return problem(reply, 401, "Unauthorized", "Sign in required.");
     reply.header("Cache-Control", "no-store");
-    return { email: admin.email, role: admin.role, tenantId: admin.tenantId };
+    const consent = admin.role === "tenant" && admin.id !== "service-key" ? await store.getLatestConsent(admin.id) : null;
+    const requiresConsent = admin.role === "tenant" && (!consent || consent.termsVersion !== config.TERMS_VERSION || consent.privacyVersion !== config.PRIVACY_VERSION);
+    return {
+      email: admin.email,
+      role: admin.role,
+      tenantId: admin.tenantId,
+      requiresConsent,
+      termsVersion: config.TERMS_VERSION,
+      privacyVersion: config.PRIVACY_VERSION
+    };
+  });
+
+  app.post("/v1/admin/consent", async (request, reply) => {
+    if (!sameOrigin(request)) return problem(reply, 403, "Forbidden", "Invalid origin.");
+    const admin = await adminFor(request);
+    if (!admin) return problem(reply, 401, "Unauthorized", "Sign in required.");
+    const parsed = z.object({
+      accepted: z.literal(true),
+      termsVersion: z.string().max(40).optional(),
+      privacyVersion: z.string().max(40).optional()
+    }).strict().safeParse(request.body);
+    if (!parsed.success) {
+      return problem(reply, 422, "Consent required", "You must accept the Terms and Conditions and the Privacy Policy to continue.", { code: "CONSENT_REQUIRED" });
+    }
+    await store.recordConsent({
+      adminId: admin.id,
+      termsVersion: config.TERMS_VERSION,
+      privacyVersion: config.PRIVACY_VERSION,
+      ipAddress: request.ip,
+      userAgent: firstHeader(request.headers["user-agent"]) ?? null,
+      now: now()
+    });
+    return { ok: true, termsVersion: config.TERMS_VERSION, privacyVersion: config.PRIVACY_VERSION };
   });
 
   app.post("/v1/admin/users", async (request, reply) => {
